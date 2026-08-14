@@ -12,11 +12,19 @@ from cli.container_cli import (
     container_remove_network,
     container_start_vllm_sr,
     container_status,
+    container_status_strict,
     container_stop_container,
     load_openclaw_registry,
 )
 from cli.container_images import get_fleet_sim_container_image, get_runtime_images
 from cli.logo import print_vllm_logo
+from cli.recipe_activation_recovery import (
+    active_recipe_package_for_stack,
+    recover_pending_recipe_activation_for_stack,
+)
+from cli.recipe_directory import resolve_active_recipe_directory
+from cli.runtime_config_coordination import runtime_config_lock_scope
+from cli.runtime_config_lock import RuntimeConfigLock
 from cli.runtime_lifecycle import (
     connect_runtime_container,
     ensure_clean_runtime_container,
@@ -31,6 +39,7 @@ from cli.runtime_lifecycle import (
     start_observability_stack,
     wait_for_router_health,
 )
+from cli.runtime_management_config import _configured_management_port
 from cli.runtime_stack import RuntimeStackLayout, resolve_runtime_stack
 from cli.runtime_topology import resolve_runtime_topology
 from cli.storage_backends import provision_storage_backends
@@ -38,6 +47,7 @@ from cli.utils import get_logger, load_config
 
 log = get_logger(__name__)
 STATE_ROOT_DIR_ENV = "VLLM_SR_STATE_ROOT_DIR"
+MANAGED_STORAGE_BACKENDS_ENV = "VLLM_SR_MANAGED_STORAGE_BACKENDS"
 
 SERVICE_LOG_PATTERNS = {
     "router": r'"caller"|spawned: \'router\'|success: router|cli\.commands',
@@ -147,16 +157,85 @@ def start_vllm_sr(
     enable_observability=True,
     source_config_file=None,
     runtime_config_file=None,
+    runtime_config_lock: RuntimeConfigLock | None = None,
 ):
     """Start vLLM Semantic Router."""
     env_vars = env_vars if env_vars is not None else {}
     stack_layout = resolve_runtime_stack()
     runtime_topology = resolve_runtime_topology(topology)
-
-    print_vllm_logo()
     source_config_file = source_config_file or config_file
     runtime_config_file = runtime_config_file or config_file
-    user_config, listeners = _load_runtime_config(runtime_config_file)
+    state_root_dir = _resolve_state_root_dir(source_config_file, env_vars)
+    with runtime_config_lock_scope(
+        runtime_config_lock,
+        runtime_config_file,
+        state_root_dir,
+        stack_layout,
+    ):
+        return _start_vllm_sr_locked(
+            source_config_file=source_config_file,
+            runtime_config_file=runtime_config_file,
+            env_vars=env_vars,
+            stack_layout=stack_layout,
+            runtime_topology=runtime_topology,
+            state_root_dir=state_root_dir,
+            image=image,
+            router_image=router_image,
+            envoy_image=envoy_image,
+            dashboard_image=dashboard_image,
+            sim_image=sim_image,
+            pull_policy=pull_policy,
+            enable_observability=enable_observability,
+        )
+
+
+def _preflight_runtime_config(
+    source_config_file,
+    runtime_config_file,
+    state_root_dir,
+    stack_layout,
+):
+    print_vllm_logo()
+    recover_pending_recipe_activation_for_stack(
+        runtime_config_path=runtime_config_file,
+        state_root_dir=state_root_dir,
+        stack_name=stack_layout.stack_name,
+        managed_container_names=stack_layout.runtime_container_names,
+        status_provider=container_status_strict,
+    )
+    active_recipe_package_for_stack(
+        state_root_dir=state_root_dir,
+        stack_name=stack_layout.stack_name,
+    )
+    # Reject an incomplete managed Recipe before stopping an existing stack or
+    # provisioning any support services.
+    resolve_active_recipe_directory(source_config_file)
+    return _load_runtime_config(runtime_config_file)
+
+
+def _start_vllm_sr_locked(
+    *,
+    source_config_file,
+    runtime_config_file,
+    env_vars,
+    stack_layout,
+    runtime_topology,
+    state_root_dir,
+    image,
+    router_image,
+    envoy_image,
+    dashboard_image,
+    sim_image,
+    pull_policy,
+    enable_observability,
+):
+    user_config, listeners = _preflight_runtime_config(
+        source_config_file,
+        runtime_config_file,
+        state_root_dir,
+        stack_layout,
+    )
+    management_port = _configured_management_port(user_config)
 
     log_startup_banner(source_config_file, listeners, stack_layout)
     log.info(f"Runtime topology: {runtime_topology}")
@@ -215,7 +294,7 @@ def start_vllm_sr(
     if maybe_finish_setup_mode(setup_mode, dashboard_disabled, stack_layout):
         return
 
-    _wait_and_verify_runtime(stack_layout, dashboard_disabled)
+    _wait_and_verify_runtime(stack_layout, dashboard_disabled, management_port)
     recover_openclaw_containers(state_root_dir, env_vars, shared_network_name)
     log_runtime_summary(
         listeners,
@@ -240,6 +319,7 @@ def _start_support_services(
     started_backends = provision_storage_backends(
         user_config, shared_network_name, stack_layout, state_root_dir=state_root_dir
     )
+    env_vars[MANAGED_STORAGE_BACKENDS_ENV] = ",".join(sorted(started_backends))
     observability_network_name = start_observability_stack(
         enable_observability,
         shared_network_name,
@@ -296,9 +376,11 @@ def _start_runtime_containers(
     )
 
 
-def _wait_and_verify_runtime(stack_layout, dashboard_disabled):
+def _wait_and_verify_runtime(
+    stack_layout, dashboard_disabled, management_port=DEFAULT_API_PORT
+):
     """Wait for health check and verify core runtime containers are still running."""
-    wait_for_router_health(stack_layout)
+    wait_for_router_health(stack_layout, management_port=management_port)
     for service in ("router", "envoy"):
         ensure_runtime_container_not_exited(
             stack_layout.service_container_name(service)

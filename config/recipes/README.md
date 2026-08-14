@@ -7,8 +7,9 @@ catalog taxonomy.
 
 ## Delivery contract
 
-Every child directory has the same four files:
+Every child directory has the same five files:
 
+- `metadata.yaml` — versioned identity, authorship, license, tags, and links.
 - `config.yaml` — canonical v0.3 runtime configuration.
 - `recipe.dsl` — reviewable routing policy that compiles back into the same
   dynamic routing surface.
@@ -19,20 +20,137 @@ The repository contract tests reject incomplete directories, invalid YAML or
 DSL, YAML/DSL drift, missing decision reachability, stale aliases, and loss of
 YAML-only decision adaptation policy during DSL merge.
 
-Probe manifests use `schema_version: v1` and are validated against
-`tools/agent/schemas/recipe-probes-v1.schema.json`. The conformance inventory
-discovers every immediate child directory automatically. Adding a recipe
-therefore adds it to static and live CI without a workflow or Go allowlist
-change.
+Managed recipe metadata uses `schema_version: vllm-sr/recipe-metadata/v1` and
+is validated against `config/schemas/recipe-metadata-v1.schema.json`. Its `id`
+must match the recipe directory. Probe manifests use `schema_version: v1` and
+are validated against `tools/agent/schemas/recipe-probes-v1.schema.json`. The
+conformance inventory discovers every immediate child directory automatically
+and includes its metadata identity. Adding a recipe therefore adds it to static
+and live CI without a workflow or Go allowlist change.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the short contributor checklist,
 coverage tiers, tag conventions, and local commands.
+
+## Built-in models and custom Recipe transport
+
+`config/recipes/` contains standalone maintained examples and user-oriented
+Recipe sources. Curated out-of-box models live only under
+[`config/built-in/latest/`](../built-in/README.md), using the same five-file
+contract plus version/catalog metadata, and are copied into the `vllm-sr` wheel
+and release images. Curated models therefore require no GitHub download or
+Dashboard HTTPS import:
+
+```bash
+vllm-sr model list
+vllm-sr model show vllm-sr/chorus-v1
+vllm-sr model fork vllm-sr/chorus-v1 chorus-v1.yaml
+vllm-sr model validate chorus-v1.yaml
+```
+
+The catalog enables `vllm-sr/chorus-v1` by default. Fork can select more than
+one compatible entrypoint from the same bundled config and choose which selected
+model is the default:
+
+```bash
+vllm-sr model fork vllm-sr/chorus-v1 chorus-custom.yaml \
+  --enable vllm-sr/chorus-v1-vault \
+  --default vllm-sr/chorus-v1
+```
+
+`latest/` tracks the reviewed catalog on `main`. Immutable `vX.Y/` directories
+are generated only while preparing that release:
+
+```bash
+make built-in-model-snapshot RELEASE_VERSION=X.Y.Z
+```
+
+The target refuses to overwrite an existing snapshot. A tag `vX.Y.Z` cannot
+publish unless
+`config/built-in/vX.Y/catalog.yaml` exists with `channel: release`,
+`release: vX.Y`, and `catalog_version: vX.Y`. The wheel checks the catalog and
+every exact-five bundle resource discovered in that snapshot rather than a
+hard-coded version list. Use `--catalog-version vX.Y` to inspect or fork a
+published snapshot, `model list --all-versions` to see installed history, and
+`model list --all` to
+include incompatible entries with their reason. A future
+`vllm-sr/chorus-v2` coexists as a new policy generation; compatibility is
+declared by catalog metadata rather than inferred from the name.
+
+Each model declares traits, required backend roles, minimum pool sizes, and
+recommended candidates. Recommendations are not a vendor lock: users can fork
+and bind any suitable models. The `verified` status applies only to the exact
+maintainer-bound asset digest; a modified or differently bound fork is valid
+canonical YAML but is reported as `custom/unverified`.
+
+Built-in catalogs and Recipe YAML are not attached to GitHub Releases as ZIP
+assets. The **Built-in Model Catalog** workflow validates authoring conformance,
+source-to-wheel drift, and installed CLI discovery. Its short-lived artifact is
+a checksum and command-output receipt, not a package registry.
+
+`vllm-sr recipe pack` remains available only as a compatibility transport for
+a custom five-file Recipe directory. Built-in model discovery and the Dashboard
+catalog never import this archive; they list the packaged `latest` and released
+`vX.Y` catalogs directly:
+
+```bash
+vllm-sr recipe pack path/to/custom-recipe
+```
+
+The deterministic ZIP contains the same `metadata.yaml`, `config.yaml`,
+`probes.yaml`, `recipe.dsl`, and `README.md`; it is not a built-in catalog
+format. Teams may host a custom archive at a trusted HTTPS location for the
+custom transport API, or extract it and serve its `config.yaml` directly. The
+command emits the archive path, SHA-256, and content-addressed `recipe_digest`.
+It rejects missing files, symlinks, unrelated entries, literal credentials,
+embedded URL credentials, sensitive query parameters, credential-carrying
+headers, YAML indirection/explicit tags, and local-process MCP transports.
+
+Treat every shared custom archive as public source. Use `api_key_env` or a pure
+environment reference such as `${PROVIDER_API_KEY}`; the packer never expands
+environment variables or exports runtime state, and its errors never print a
+rejected secret value.
+
+Bind each required name explicitly when the local stack starts:
+
+```bash
+export PROVIDER_API_KEY=...  # keep the value outside the Recipe
+vllm-sr serve --config path/to/recipe/config.yaml \
+  --recipe-env PROVIDER_API_KEY
+```
+
+The value is inherited by the Router and Dashboard containers without being
+written into the archive, API responses, runtime config, logs, or container
+command arguments.
 
 Single-profile recipes expose their `routing` block through the default
 `global.router.auto_model_names` entrypoint. Multi-profile configurations can
 disable that default and expose named `entrypoints` instead. Conformance counts
 and exercises both forms, so a default auto alias is not reported as zero
 entrypoints.
+
+## Use an authoring or custom recipe in Dashboard
+
+Serve the recipe's canonical config through the existing local stack:
+
+```bash
+vllm-sr serve --config config/recipes/<use-case>/config.yaml
+```
+
+The command remains compatible with bare configs and managed Recipe paths, but
+the supplied `--config` is now a read-only source. Each local stack runs from a
+runtime-owned `.vllm-sr/runtime-config[.<stack>].yaml`. Dashboard edits and
+package activations change that active file and survive a restart. When the
+active file has diverged, a later source edit is not silently copied over it;
+`serve` preserves the active version and logs a warning.
+
+The Dashboard mounts only that directory's five fixed files and treats it as
+the single active Recipe; it does not scan sibling recipes or catalog paths. In
+the existing **Mixture-of-Models** page, **Overview** shows identity, source
+health, inventory, and README content, while **Probes** provides server-paged
+filtering and lazy detail. **Run** starts a clean Playground conversation,
+**Edit** prepares the terminal user turn without sending it, and **Validate**
+calls the live Router Eval API without generating an answer. A bare
+`config.yaml` remains supported and is reported as unmanaged.
 
 ## Catalog
 
@@ -50,12 +168,17 @@ entrypoints.
 deployable recipes. Their behavior is covered by DSL unit tests instead of
 being mixed into this catalog.
 
+The curated model index is separate:
+[Chorus V1](../built-in/latest/chorus-v1/README.md) is canonical only under
+`config/built-in/latest/` and uses the same exact-five Recipe contract plus
+catalog/version bindings.
+
 ## Maintained acceptance baseline
 
-The blocking August 2026 baseline covers 275 base probes, 58 decisions, and 11
-recipe-entrypoint bindings across all seven recipes. Decision, entrypoint,
-fallback, algorithm, and plugin coverage is complete; signal and projection
-assertions use checked-in per-recipe ratchets that cannot decrease:
+The blocking August 2026 standalone-recipe baseline covers 275 base probes,
+58 decisions, and 11 recipe-entrypoint bindings across seven recipes. Decision,
+entrypoint, fallback, algorithm, and plugin coverage is complete; signal and
+projection assertions use checked-in per-recipe ratchets that cannot decrease:
 
 - Accuracy: 13 probes, 4 decisions.
 - Agent: 27 probes, 11 decisions.

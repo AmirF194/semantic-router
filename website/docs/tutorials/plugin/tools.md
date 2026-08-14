@@ -21,6 +21,7 @@ Tool behavior is part of route policy. Some routes should strip tools entirely, 
 - a route should disable all tools
 - a route should semantically select tools from the global tools database
 - a route should restrict tool access with explicit allow/block lists
+- a privacy route should keep tool history available for routing but omit prior tool/function calls and results from the selected model request
 
 ## Configuration
 
@@ -39,3 +40,9 @@ plugin:
     block_tools:
       - admin.delete
 ```
+
+Set `mode: none` with `strip_tool_history: true` when the selected backend must not receive prior
+assistant tool/function calls or tool/function result messages. The router
+applies this policy after signal and decision evaluation, so it does not change
+which route matched. It only changes the provider-bound request body. Validation
+rejects `strip_tool_history: true` with any other tool mode.

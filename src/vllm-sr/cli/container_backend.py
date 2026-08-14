@@ -30,6 +30,7 @@ class ContainerBackend:
         topology: str | None = None,
         pull_policy: str | None = None,
         enable_observability: bool = True,
+        runtime_config_lock: Any = None,
         **kwargs: Any,
     ) -> None:
         if source_config_file is None:
@@ -49,6 +50,7 @@ class ContainerBackend:
             topology=topology,
             pull_policy=pull_policy,
             enable_observability=enable_observability,
+            runtime_config_lock=runtime_config_lock,
         )
 
     def teardown(self) -> None:

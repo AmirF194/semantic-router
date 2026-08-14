@@ -17,6 +17,7 @@ from router_calibration_probe import (
     VARIANT_FIELDS,
     Probe,
     ProbePadding,
+    ProbePlaygroundPolicy,
     load_grouped_probes,
     reject_unknown_fields,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "VARIANT_FIELDS",
     "Probe",
     "ProbePadding",
+    "ProbePlaygroundPolicy",
     "load_probe_manifest",
 ]
 

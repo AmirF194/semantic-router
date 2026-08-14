@@ -30,6 +30,18 @@ classifiers plus the configured Postgres replay store. Startup is not accepted
 until those modules initialize, and live validation checks replay writes rather
 than treating plugin presence as sufficient.
 
+Keep the replay-store password outside this distributable Recipe. For the
+built-in local Postgres service, bind its current development password
+explicitly when serving:
+
+```bash
+export POSTGRES_PASSWORD=router-secret
+vllm-sr serve --config config/recipes/agent/config.yaml \
+  --recipe-env POSTGRES_PASSWORD
+```
+
+Use a separately managed value and service in production.
+
 ## Validate
 
 ```bash

@@ -2,7 +2,18 @@
 
 import os
 import subprocess
+from pathlib import Path
 
+from cli.commands.runtime_paths import (
+    _container_readonly_source_config_path,
+    _container_runtime_config_path,
+    _runtime_config_output_path,
+    materialize_runtime_config,
+)
+from cli.commands.runtime_support import (
+    RECIPE_ENV_ALLOWLIST_ENV,
+    sensitive_env_names,
+)
 from cli.config_generator import generate_envoy_config_from_user_config
 from cli.consts import (
     DEFAULT_NOFILE_LIMIT,
@@ -15,6 +26,7 @@ from cli.container_images import (
     _normalize_platform,
     get_runtime_images,
 )
+from cli.container_management_listener import _managed_management_listener
 from cli.container_openclaw_support import configure_openclaw_support
 from cli.container_run_command import (
     append_custom_dns,
@@ -33,7 +45,8 @@ from cli.container_services import (
     container_stop_container,
 )
 from cli.parser import parse_user_config
-from cli.runtime_stack import RuntimeStackLayout, resolve_runtime_stack
+from cli.recipe_directory import resolve_active_recipe_directory
+from cli.runtime_stack import PORT_OFFSET_ENV, RuntimeStackLayout, resolve_runtime_stack
 from cli.runtime_topology import resolve_runtime_topology
 from cli.utils import get_logger
 
@@ -78,11 +91,13 @@ def container_start_vllm_sr(
         config_file,
         runtime_config_file=runtime_config_file,
         state_root_dir=state_root_dir,
+        stack_layout=stack_layout,
     )
     common_env = _build_common_runtime_env(
         env_vars,
         stack_layout,
         runtime_container_config=runtime_container_config,
+        recipe_store_dir=runtime_paths["container_recipe_store_dir"],
     )
     _render_split_envoy_config(
         runtime_paths["effective_config_path"],
@@ -139,10 +154,16 @@ def _build_common_runtime_env(
     stack_layout: RuntimeStackLayout,
     *,
     runtime_container_config: str | None,
+    recipe_store_dir: str | None = None,
 ):
     common_env = dict(env_vars or {})
-    if runtime_container_config:
-        common_env.setdefault("VLLM_SR_RUNTIME_CONFIG_PATH", runtime_container_config)
+    common_env["VLLM_SR_RUNTIME_CONFIG_PATH"] = runtime_container_config
+    common_env["VLLM_SR_SOURCE_CONFIG_PATH"] = runtime_container_config
+    common_env["VLLM_SR_STATE_ROOT_DIR"] = "/app"
+    common_env["VLLM_SR_CONFIG_BASE_DIR"] = "/app"
+    common_env[PORT_OFFSET_ENV] = str(stack_layout.port_offset)
+    if recipe_store_dir:
+        common_env["VLLM_SR_RECIPE_STORE_DIR"] = recipe_store_dir
     stack_name_value = os.getenv("VLLM_SR_STACK_NAME", "").strip()
     if stack_name_value:
         common_env.setdefault("VLLM_SR_STACK_NAME", stack_name_value)
@@ -218,7 +239,20 @@ def _runtime_container_specs(
     stack_layout: RuntimeStackLayout,
 ):
     listener_port = _primary_listener_port(listeners)
+    management_listener = _managed_management_listener(
+        runtime_paths["effective_config_path"], stack_layout
+    )
+    listener_host_ports = {
+        listener["port"] + stack_layout.port_offset
+        for listener in listeners
+        if listener.get("port")
+    }
+    if management_listener["host_port"] in listener_host_ports:
+        raise ValueError(
+            "management API host port conflicts with an Envoy listener host port"
+        )
     setup_mode = str(common_env.get("VLLM_SR_SETUP_MODE", "")).lower() == "true"
+    inherited_sensitive_env = _sensitive_runtime_env_names(common_env, runtime_paths)
     router_cmd = _build_router_runtime_command(
         runtime=runtime,
         router_image=image_by_service["router"],
@@ -229,6 +263,8 @@ def _runtime_container_specs(
         runtime_paths=runtime_paths,
         setup_mode=setup_mode,
         stack_layout=stack_layout,
+        inherited_sensitive_env=inherited_sensitive_env,
+        management_listener=management_listener,
     )
     envoy_cmd = _build_envoy_runtime_command(
         runtime=runtime,
@@ -261,6 +297,8 @@ def _runtime_container_specs(
         openclaw_network_name=openclaw_network_name,
         runtime_paths=runtime_paths,
         stack_layout=stack_layout,
+        inherited_sensitive_env=inherited_sensitive_env,
+        management_listener=management_listener,
     )
     specs.append(("dashboard", stack_layout.dashboard_container_name, dashboard_cmd))
 
@@ -278,6 +316,8 @@ def _build_router_runtime_command(
     runtime_paths: dict[str, str],
     setup_mode: bool,
     stack_layout: RuntimeStackLayout,
+    inherited_sensitive_env: set[str],
+    management_listener: dict[str, int | str],
 ):
     router_env = router_runtime_env(common_env, normalized_platform)
     return _build_service_run_command(
@@ -289,18 +329,23 @@ def _build_router_runtime_command(
         env_vars=router_env,
         mount_specs=_runtime_mount_specs(runtime_paths, include_models=True),
         port_mappings=[
-            (stack_layout.router_port, 50051),
-            (stack_layout.metrics_port, 9190),
-            (stack_layout.api_port, 8080),
+            ("127.0.0.1", stack_layout.router_port, 50051),
+            ("127.0.0.1", stack_layout.metrics_port, 9190),
+            (
+                "127.0.0.1",
+                int(management_listener["host_port"]),
+                int(management_listener["port"]),
+            ),
         ],
         entrypoint="/app/start-router.sh",
         command_args=[
-            router_env.get("VLLM_SR_RUNTIME_CONFIG_PATH", "/app/config.yaml"),
+            runtime_paths["runtime_container_config"],
             "/app/.vllm-sr",
         ],
         enable_amd_gpu=normalized_platform == PLATFORM_AMD,
         enable_nvidia_gpu=normalized_platform == PLATFORM_NVIDIA,
         start_immediately=not setup_mode,
+        inherited_env_keys=inherited_sensitive_env,
     )
 
 
@@ -327,7 +372,11 @@ def _build_envoy_runtime_command(
             f"{runtime_paths['envoy_config_path']}:/etc/envoy/envoy.yaml:z",
         ],
         port_mappings=[
-            (listener["port"] + stack_layout.port_offset, listener["port"])
+            (
+                _listener_host_address(listener),
+                listener["port"] + stack_layout.port_offset,
+                listener["port"],
+            )
             for listener in listeners
             if listener.get("port")
         ],
@@ -339,6 +388,15 @@ def _build_envoy_runtime_command(
             "debug",
         ],
         start_immediately=not setup_mode,
+    )
+
+
+def _listener_host_address(listener: dict) -> str:
+    address = str(listener.get("address") or "").strip()
+    if address in {"0.0.0.0", "::", "127.0.0.1", "::1"}:
+        return address
+    raise ValueError(
+        "listener address must be an explicit wildcard or loopback IP for host publication"
     )
 
 
@@ -354,15 +412,28 @@ def _build_dashboard_runtime_command(
     openclaw_network_name: str | None,
     runtime_paths: dict[str, str],
     stack_layout: RuntimeStackLayout,
+    inherited_sensitive_env: set[str],
+    management_listener: dict[str, int | str],
 ):
     dashboard_env = _build_dashboard_runtime_env(
         common_env=common_env,
         listener_port=listener_port,
         stack_layout=stack_layout,
+        management_port=int(management_listener["port"]),
     )
     dashboard_mount_specs = _runtime_mount_specs(
         runtime_paths, include_dashboard_data=True
     )
+    dashboard_mount_specs.extend(_active_recipe_mount_specs(runtime_paths))
+    if runtime_paths.get("active_recipe_root"):
+        dashboard_env["VLLM_SR_ACTIVE_RECIPE_DIR"] = "/app/recipe"
+    else:
+        dashboard_env.pop("VLLM_SR_ACTIVE_RECIPE_DIR", None)
+    dashboard_env["DASHBOARD_CONFIG_DIR"] = "/app"
+    dashboard_env["ROUTER_CONFIG_PATH"] = runtime_paths["runtime_container_config"]
+    dashboard_env["VLLM_SR_RECIPE_STORE_DIR"] = runtime_paths[
+        "container_recipe_store_dir"
+    ]
     configure_openclaw_support(
         dashboard_mount_specs,
         dashboard_env,
@@ -381,10 +452,28 @@ def _build_dashboard_runtime_command(
         env_vars=dashboard_env,
         mount_specs=dashboard_mount_specs,
         port_mappings=[(stack_layout.dashboard_port, 8700)],
-        entrypoint="/app/start-dashboard.sh",
-        command_args=["/app/config.yaml"],
-        inherited_env_keys={"DASHBOARD_ADMIN_PASSWORD"},
+        entrypoint="/app/entrypoint.sh",
+        command_args=[
+            "/app/start-dashboard.sh",
+            runtime_paths["runtime_container_config"],
+        ],
+        inherited_env_keys={"DASHBOARD_ADMIN_PASSWORD"} | inherited_sensitive_env,
     )
+
+
+def _recipe_env_binding_names(common_env: dict[str, str]) -> set[str]:
+    raw = common_env.get(RECIPE_ENV_ALLOWLIST_ENV, "")
+    return {name for item in raw.split(",") if (name := item.strip())}
+
+
+def _sensitive_runtime_env_names(
+    common_env: dict[str, str], runtime_paths: dict[str, str]
+) -> set[str]:
+    """Return value-bearing env names that must stay out of Docker argv/logs."""
+
+    names = set(sensitive_env_names(runtime_paths.get("source_config_path")))
+    names.update(_recipe_env_binding_names(common_env))
+    return names & set(common_env)
 
 
 def _build_dashboard_runtime_env(
@@ -392,6 +481,7 @@ def _build_dashboard_runtime_env(
     common_env: dict[str, str],
     listener_port: int,
     stack_layout: RuntimeStackLayout,
+    management_port: int = 8080,
 ):
     dashboard_env = dict(common_env)
     for name in (
@@ -412,8 +502,8 @@ def _build_dashboard_runtime_env(
         if not (bootstrap_email and bootstrap_password):
             dashboard_env[bootstrap_policy_env] = "true"
 
-    dashboard_env.setdefault(
-        "TARGET_ROUTER_API_URL", stack_layout.router_api_service_url
+    dashboard_env["TARGET_ROUTER_API_URL"] = (
+        f"http://{stack_layout.router_container_name}:{management_port}"
     )
     dashboard_env.setdefault(
         "TARGET_ROUTER_METRICS_URL", stack_layout.router_metrics_service_url
@@ -466,7 +556,9 @@ def _prepare_runtime_paths(
     config_file,
     runtime_config_file=None,
     state_root_dir=None,
+    stack_layout: RuntimeStackLayout | None = None,
 ):
+    stack_layout = stack_layout or resolve_runtime_stack()
     source_config_path = os.path.abspath(config_file)
     runtime_config_path = os.path.abspath(runtime_config_file or config_file)
     config_dir = (
@@ -479,26 +571,56 @@ def _prepare_runtime_paths(
     os.makedirs(vllm_sr_dir, exist_ok=True)
     log.info(f"Mounting .vllm-sr directory: {vllm_sr_dir}")
 
-    models_dir = os.path.join(config_dir, "models")
+    active_config_path = _runtime_config_output_path(
+        Path(source_config_path),
+        state_root_dir=config_dir,
+        stack_name=stack_layout.stack_name,
+    )
+    if Path(runtime_config_path).resolve() != active_config_path.resolve():
+        active_config_path = materialize_runtime_config(
+            Path(source_config_path),
+            Path(runtime_config_path).read_bytes(),
+            state_root_dir=config_dir,
+            stack_name=stack_layout.stack_name,
+        )
+    runtime_config_path = str(active_config_path)
+
+    active_recipe = resolve_active_recipe_directory(source_config_path)
+    # A managed Recipe source is a distributable five-file directory. Keep
+    # mutable model/runtime state under its explicitly ignored .vllm-sr area
+    # so serving it never changes the package contract.
+    models_dir = (
+        os.path.join(vllm_sr_dir, "models")
+        if active_recipe
+        else os.path.join(config_dir, "models")
+    )
     os.makedirs(models_dir, exist_ok=True)
 
     dashboard_data_dir = os.path.join(config_dir, ".vllm-sr", "dashboard-data")
     os.makedirs(dashboard_data_dir, exist_ok=True)
     log.info(f"Mounting dashboard data directory: {dashboard_data_dir}")
 
+    recipe_store_dir = os.path.join(
+        vllm_sr_dir, "recipe-store", stack_layout.stack_name
+    )
+    os.makedirs(recipe_store_dir, exist_ok=True)
+
     effective_config_path = runtime_config_path
     envoy_config_path = os.path.join(vllm_sr_dir, "envoy.yaml")
 
-    runtime_container_config = None
-    if runtime_config_path != source_config_path:
-        runtime_container_config = (
-            f"/app/.vllm-sr/{os.path.basename(runtime_config_path)}"
-        )
-        log.info(
-            "Using source config %s with runtime override %s",
-            source_config_path,
-            runtime_container_config,
-        )
+    runtime_container_config = _container_runtime_config_path(
+        Path(source_config_path), stack_name=stack_layout.stack_name
+    )
+    log.info(
+        "Using read-only source config %s with active runtime config %s",
+        source_config_path,
+        runtime_container_config,
+    )
+
+    active_recipe_paths = {
+        f"active_recipe_{name.replace('.', '_').replace('-', '_')}_path": str(path)
+        for name, path in (active_recipe.assets if active_recipe else ())
+    }
 
     return (
         config_dir,
@@ -508,7 +630,14 @@ def _prepare_runtime_paths(
             "vllm_sr_dir": vllm_sr_dir,
             "models_dir": models_dir,
             "dashboard_data_dir": dashboard_data_dir,
+            "recipe_store_dir": recipe_store_dir,
+            "container_recipe_store_dir": (
+                f"/app/.vllm-sr/recipe-store/{stack_layout.stack_name}"
+            ),
             "envoy_config_path": envoy_config_path,
+            "runtime_container_config": runtime_container_config,
+            "active_recipe_root": str(active_recipe.root) if active_recipe else "",
+            **active_recipe_paths,
         },
         runtime_container_config,
     )
@@ -521,13 +650,30 @@ def _runtime_mount_specs(
     include_dashboard_data: bool = False,
 ):
     mounts = [
-        f"{runtime_paths['source_config_path']}:/app/config.yaml:z",
+        f"{runtime_paths['source_config_path']}:{_container_readonly_source_config_path()}:ro,z",
         f"{runtime_paths['vllm_sr_dir']}:/app/.vllm-sr:z",
     ]
     if include_models:
         mounts.append(f"{runtime_paths['models_dir']}:/app/models:z")
     if include_dashboard_data:
         mounts.append(f"{runtime_paths['dashboard_data_dir']}:/app/data:z")
+    return mounts
+
+
+def _active_recipe_mount_specs(runtime_paths: dict[str, str]) -> list[str]:
+    if not runtime_paths.get("active_recipe_root"):
+        return []
+
+    mounts = []
+    for filename in (
+        "config.yaml",
+        "metadata.yaml",
+        "probes.yaml",
+        "recipe.dsl",
+        "README.md",
+    ):
+        key = f"active_recipe_{filename.replace('.', '_').replace('-', '_')}_path"
+        mounts.append(f"{runtime_paths[key]}:/app/recipe/{filename}:ro,z")
     return mounts
 
 
@@ -575,7 +721,7 @@ def _build_service_run_command(
     network_name: str,
     env_vars: dict[str, str],
     mount_specs: list[str],
-    port_mappings: list[tuple[int, int]],
+    port_mappings: list[tuple[int, int] | tuple[str, int, int]],
     entrypoint: str,
     command_args: list[str],
     enable_amd_gpu: bool = False,

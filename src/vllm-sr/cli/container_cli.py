@@ -23,6 +23,7 @@ from cli.container_services import (
     container_start_prometheus,
     container_start_redis,
     container_status,
+    container_status_strict,
     container_stop_container,
     load_openclaw_registry,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "container_start_redis",
     "container_start_vllm_sr",
     "container_status",
+    "container_status_strict",
     "container_stop_container",
     "get_container_image",
     "get_container_runtime",

@@ -60,6 +60,10 @@ def _compare_probe_outcome(
         if str(model).strip()
     )
     actual_model = str(data.get("requested_model") or "").strip()
+    selected_model = str(data.get("selected_model") or "").strip()
+    selection_status = str(data.get("selection_status") or "").strip()
+    selection_method = str(data.get("selection_method") or "").strip()
+    signal_errors = data.get("signal_errors") or {}
     actual_recipe = str(data.get("recipe") or "").strip()
     expected_recipe = probe.expected_recipe or "default"
     actual_algorithm = str(decision_result.get("algorithm") or "").strip()
@@ -85,6 +89,13 @@ def _compare_probe_outcome(
         expected_decision=probe.expected_decision,
         allowed_decisions=allowed_decisions,
     )
+    selection_comparison = compare_eval_selection(
+        algorithm=probe.expected_algorithm,
+        selected_model=selected_model,
+        status=selection_status,
+        method=selection_method,
+        recommended_models=actual_models,
+    )
     checks = {
         "decision": actual_decision == probe.expected_decision,
         "model": probe.model is None or actual_model == probe.model,
@@ -97,12 +108,18 @@ def _compare_probe_outcome(
         "signals": signal_comparison["matched"],
         "alias": expected_alias_matches(probe.expected_alias, actual_models),
         "trace": trace_comparison["matched"],
+        "signal_errors": not signal_errors,
+        "selection": selection_comparison["matched"],
     }
     return {
         "decision_result": decision_result,
         "actual_decision": actual_decision,
         "actual_models": actual_models,
         "actual_model": actual_model,
+        "selected_model": selected_model,
+        "selection_status": selection_status,
+        "selection_method": selection_method,
+        "signal_errors": signal_errors,
         "actual_recipe": actual_recipe,
         "expected_recipe": expected_recipe,
         "actual_algorithm": actual_algorithm,
@@ -110,6 +127,7 @@ def _compare_probe_outcome(
         "signal_comparison": signal_comparison,
         "plugin_comparison": plugin_comparison,
         "trace_comparison": trace_comparison,
+        "selection_comparison": selection_comparison,
         "checks": checks,
         "matched": all(checks.values()),
     }
@@ -122,6 +140,7 @@ def _build_probe_result(
     signals = outcome["signal_comparison"]
     plugins = outcome["plugin_comparison"]
     trace = outcome["trace_comparison"]
+    selection = outcome["selection_comparison"]
     decision_result = outcome["decision_result"]
     return {
         "id": probe.probe_id,
@@ -130,6 +149,10 @@ def _build_probe_result(
         "expected_decision": probe.expected_decision,
         "model": probe.model,
         "actual_model": outcome["actual_model"],
+        "selected_model": outcome["selected_model"],
+        "selection_status": outcome["selection_status"],
+        "selection_method": outcome["selection_method"],
+        "signal_errors": outcome["signal_errors"],
         "expected_recipe": outcome["expected_recipe"],
         "actual_recipe": outcome["actual_recipe"],
         "expected_algorithm": probe.expected_algorithm,
@@ -149,6 +172,8 @@ def _build_probe_result(
         "forbidden_signal_matches": signals["forbidden"],
         "expected_alias": probe.expected_alias,
         "query": probe.query or summarize_probe_messages(probe.messages),
+        "display_prompt": probe.display_prompt,
+        "playground": probe_playground_metadata(probe),
         "repeat": probe.repeat,
         "padding": probe_padding_metadata(probe),
         "messages": list(probe.messages),
@@ -164,6 +189,9 @@ def _build_probe_result(
         "signals_matched": checks["signals"],
         "alias_matched": checks["alias"],
         "trace_matched": checks["trace"],
+        "signal_errors_matched": checks["signal_errors"],
+        "selection_matched": checks["selection"],
+        "selection_errors": selection["errors"],
         "trace_decisions": trace["decisions"],
         "trace_errors": trace["errors"],
         "recommended_models": list(outcome["actual_models"]),
@@ -257,6 +285,61 @@ def expected_alias_matches(
     return expected_alias in actual_models
 
 
+def compare_eval_selection(
+    *,
+    algorithm: str | None,
+    selected_model: str,
+    status: str,
+    method: str,
+    recommended_models: tuple[str, ...],
+) -> dict[str, Any]:
+    """Require an honest final-selection contract when the probe names an algorithm."""
+    normalized_algorithm = str(algorithm or "").strip()
+    if not normalized_algorithm:
+        return {"matched": True, "errors": []}
+
+    expected_statuses = {
+        # Router Learning can adapt or protect these base selectors only in the
+        # mutating request path. Eval must report that deferral honestly instead
+        # of inventing a final model.
+        "static": {"selected", "execution_required"},
+        "multi_factor": {"selected", "execution_required"},
+        "latency_aware": {"selected", "execution_required"},
+        # Multi-model algorithms expose a configured final-output model when
+        # one exists; otherwise their final model is known only after execution.
+        "workflows": {"planned_final", "execution_required"},
+        "fusion": {"planned_final", "execution_required"},
+        "remom": {"planned_final", "execution_required"},
+        "confidence": {"execution_required"},
+    }.get(normalized_algorithm)
+    errors: list[str] = []
+    if not status:
+        errors.append("selection_status is missing")
+    elif expected_statuses is not None and status not in expected_statuses:
+        errors.append(
+            f"selection_status={status!r}, want one of "
+            f"{sorted(expected_statuses)!r} "
+            f"for algorithm {normalized_algorithm!r}"
+        )
+    if not method:
+        errors.append("selection_method is missing")
+    elif method != normalized_algorithm and not (
+        normalized_algorithm == "static" and method == "single"
+    ):
+        errors.append(f"selection_method={method!r}, want {normalized_algorithm!r}")
+    if status in {"selected", "planned_final"} and not selected_model:
+        errors.append(f"selected_model is required for {status}")
+    if (
+        status == "selected"
+        and selected_model
+        and selected_model not in recommended_models
+    ):
+        errors.append("selected_model is not a recommended decision candidate")
+    if status == "execution_required" and selected_model:
+        errors.append("execution_required must not fabricate selected_model")
+    return {"matched": not errors, "errors": errors}
+
+
 def compare_eval_trace(
     raw_trace: Any,
     *,
@@ -335,6 +418,13 @@ def probe_padding_metadata(probe: Probe) -> dict[str, Any] | None:
         "repeat": probe.padding.repeat,
         "placement": probe.padding.placement,
     }
+
+
+def probe_playground_metadata(probe: Probe) -> dict[str, Any]:
+    result: dict[str, Any] = {"enabled": probe.playground.enabled}
+    if probe.playground.reason:
+        result["reason"] = probe.playground.reason
+    return result
 
 
 def summarize_probe_messages(messages: tuple[dict[str, Any], ...]) -> str:

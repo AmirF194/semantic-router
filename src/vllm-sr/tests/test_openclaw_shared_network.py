@@ -163,6 +163,10 @@ def test_container_start_vllm_sr_places_dashboard_openclaw_runtime_flags_before_
     assert socket_mount_index < image_index
     assert docker_mount_index < image_index
     assert runtime_env_index < image_index
+    assert (
+        dashboard_cmd[dashboard_cmd.index("--entrypoint") + 1] == "/app/entrypoint.sh"
+    )
+    assert dashboard_cmd[image_index + 1] == "/app/start-dashboard.sh"
 
 
 def test_container_start_vllm_sr_mounts_host_docker_cli_by_default(
@@ -396,12 +400,17 @@ def test_container_start_vllm_sr_keeps_source_config_mount_with_runtime_override
     assert rc == 0
     router_cmd = _find_container_run_cmd(captured, "vllm-sr-router-container")
     envoy_cmd = _find_container_run_cmd(captured, "vllm-sr-envoy-container")
-    assert f"{source_config_path}:/app/config.yaml:z" in router_cmd
+    assert f"{source_config_path}:/app/source-config.yaml:ro,z" in router_cmd
+    assert not any("/app/config.yaml" in token for token in router_cmd)
+    assert f"{runtime_dir}:/app/.vllm-sr:z" in router_cmd
     assert (
         f"{workspace_dir / '.vllm-sr' / 'envoy.yaml'}:/etc/envoy/envoy.yaml:z"
         in envoy_cmd
     )
     assert "VLLM_SR_RUNTIME_CONFIG_PATH=/app/.vllm-sr/runtime-config.yaml" in router_cmd
+    assert "VLLM_SR_SOURCE_CONFIG_PATH=/app/.vllm-sr/runtime-config.yaml" in router_cmd
+    assert "VLLM_SR_STATE_ROOT_DIR=/app" in router_cmd
+    assert "VLLM_SR_CONFIG_BASE_DIR=/app" in router_cmd
     assert (
         "VLLM_SR_RUNTIME_CONFIG_PATH=/app/.vllm-sr/runtime-config.yaml" not in envoy_cmd
     )

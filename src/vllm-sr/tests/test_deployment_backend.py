@@ -58,6 +58,7 @@ class TestContainerBackend:
         )
 
         backend = ContainerBackend()
+        runtime_lock = object()
         backend.deploy(
             config_file="/tmp/config.yaml",
             source_config_file="/tmp/source-config.yaml",
@@ -71,6 +72,7 @@ class TestContainerBackend:
             topology="split",
             pull_policy="always",
             enable_observability=False,
+            runtime_config_lock=runtime_lock,
         )
 
         assert captured["source_config_file"] == "/tmp/source-config.yaml"
@@ -83,6 +85,7 @@ class TestContainerBackend:
         assert captured["topology"] == "split"
         assert captured["pull_policy"] == "always"
         assert captured["enable_observability"] is False
+        assert captured["runtime_config_lock"] is runtime_lock
 
     def test_teardown_delegates_to_stop_vllm_sr(self, monkeypatch):
         called = []
@@ -411,8 +414,13 @@ from click.testing import CliRunner  # noqa: E402
 
 
 class TestCLITargetRouting:
-    def test_serve_default_target_builds_docker_backend(self, monkeypatch):
+    def test_serve_default_target_builds_docker_backend(self, monkeypatch, tmp_path):
         built = []
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "version: v0.3\nlisteners:\n  - name: http\n    port: 8899\n",
+            encoding="utf-8",
+        )
 
         class _FakeDocker:
             def deploy(self, **kw):
@@ -426,18 +434,19 @@ class TestCLITargetRouting:
         monkeypatch.setattr(
             rt,
             "ensure_bootstrap_workspace",
-            lambda _: MagicMock(config_path=Path("/dev/null"), setup_mode=False),
-        )
-        monkeypatch.setattr(
-            rt,
-            "resolve_effective_config_path",
-            lambda *a: Path("/dev/null"),
+            lambda _: MagicMock(config_path=config_path, setup_mode=False),
         )
 
         runner = CliRunner()
         runner.invoke(
             main,
-            ["serve", "--config", "/dev/null", "--image-pull-policy", "never"],
+            [
+                "serve",
+                "--config",
+                str(config_path),
+                "--image-pull-policy",
+                "never",
+            ],
         )
 
         assert built and built[0] == "docker"

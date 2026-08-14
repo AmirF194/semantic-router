@@ -20,18 +20,4 @@
   .page {
     gap: 1rem;
   }
-
-  .title {
-    font-size: 1.65rem;
-  }
-
-  .description {
-    font-size: 0.9rem;
-  }
-
-  .brandBadge,
-  .eyebrow,
-  .panelPill {
-    font-size: 0.74rem;
-  }
 }

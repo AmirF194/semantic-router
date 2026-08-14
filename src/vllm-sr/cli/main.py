@@ -9,6 +9,7 @@ from cli.commands.chat import chat
 from cli.commands.completion import completion
 from cli.commands.eval import eval
 from cli.commands.general import config, model, rag, validate
+from cli.commands.recipe import recipe
 from cli.commands.runtime import dashboard, logs, serve, status, stop
 
 logo = r"""
@@ -34,6 +35,7 @@ REGISTERED_COMMANDS = (
     dashboard,
     chat,
     completion,
+    recipe,
 )
 
 

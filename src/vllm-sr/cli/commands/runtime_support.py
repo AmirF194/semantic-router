@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable
 from itertools import chain
 from pathlib import Path
 
@@ -21,12 +22,15 @@ from cli.commands.runtime_config_mutation import (
     _platform_requires_gpu_defaults,
     apply_platform_gpu_defaults,
 )
-from cli.commands.runtime_kb import _sync_runtime_kb_store
+from cli.commands.runtime_kb import (
+    _sync_runtime_kb_store,
+    _validate_package_kb_paths,
+)
 from cli.commands.runtime_looper import apply_local_looper_endpoint
 from cli.commands.runtime_paths import (
     _container_runtime_config_path,
-    _container_source_config_path,
     _write_runtime_config,
+    write_runtime_config_bytes,
 )
 from cli.consts import (
     CONTAINER_RUNTIME_ENV,
@@ -44,10 +48,12 @@ log = get_logger(__name__)
 RUNTIME_CONFIG_PATH_ENV = "VLLM_SR_RUNTIME_CONFIG_PATH"
 SOURCE_CONFIG_PATH_ENV = "VLLM_SR_SOURCE_CONFIG_PATH"
 RUNTIME_ALGORITHM_OVERRIDE_ENV = "VLLM_SR_ALGORITHM_OVERRIDE"
+RECIPE_ENV_ALLOWLIST_ENV = "VLLM_SR_RECIPE_ENV_ALLOWLIST"
 
-# Mirrors resolveBracedEnvReference, including ${NAME:-default}. Upper case only, so
-# MCP tool-argument placeholders like ${user_content} are not read as env vars.
+# Preserve trusted source-config passthrough semantics, including references
+# with fallbacks. A narrower matcher below drives package activation policy.
 _ENV_REFERENCE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::?-[^}]*)?\}")
+_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 API_KEY_ENV_FIELD = "api_key_env"
 
@@ -84,6 +90,15 @@ _DISCOVERY_DENYLIST = frozenset(
         "DASHBOARD_READONLY",
         "DASHBOARD_PLATFORM",
         "VLLM_SR_PLATFORM",
+        RECIPE_ENV_ALLOWLIST_ENV,
+        RUNTIME_CONFIG_PATH_ENV,
+        SOURCE_CONFIG_PATH_ENV,
+        "VLLM_SR_STATE_ROOT_DIR",
+        "VLLM_SR_CONFIG_BASE_DIR",
+        "VLLM_SR_RECIPE_STORE_DIR",
+        "VLLM_SR_MANAGED_STORAGE_BACKENDS",
+        "VLLM_SR_ACTIVE_RECIPE_DIR",
+        "VLLM_SR_STACK_NAME",
     }
 )
 
@@ -125,9 +140,10 @@ def validate_setup_mode_flags(setup_mode: bool, minimal: bool, readonly: bool) -
 
 
 def config_env_references(config_path: Path | str | None) -> set[str]:
-    """Env var names a config depends on: ``api_key_env`` targets and ``${VAR}`` refs.
+    """Env names used by trusted source config passthrough.
 
-    ``api_key_env`` is free-form, so these cannot be enumerated ahead of the config.
+    This preserves the established ``api_key_env`` and braced interpolation
+    behavior for operator-selected local source configs.
     """
     if config_path is None:
         return set()
@@ -152,6 +168,78 @@ def config_env_references(config_path: Path | str | None) -> set[str]:
     return names - _DISCOVERY_DENYLIST
 
 
+def required_config_env_references(config_path: Path | str | None) -> set[str]:
+    """Return every environment name Router interpolation will consult.
+
+    This parser deliberately mirrors Router's permissive tokenization, then
+    ``validate_config_recipe_env_bindings`` applies the stricter remote-package
+    name and reserved-name policy. That two-step design makes lowercase,
+    malformed, fallback, and reserved references fail closed instead of
+    disappearing from the preflight inventory.
+    """
+
+    if config_path is None:
+        return set()
+    try:
+        document = yaml.safe_load(Path(config_path).read_text())
+    except (OSError, yaml.YAMLError):
+        return set()
+
+    names: set[str] = set()
+    pending: list[object] = [document]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            named = node.get(API_KEY_ENV_FIELD)
+            if isinstance(named, str) and named.strip():
+                names.add(named.strip())
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+        elif isinstance(node, str):
+            names.update(_router_consulted_env_names(node))
+    return names
+
+
+def _router_consulted_env_names(value: str) -> set[str]:
+    names: set[str] = set()
+    index = 0
+    while index < len(value):
+        if value[index] != "$":
+            index += 1
+            continue
+        if index + 1 < len(value) and value[index + 1] == "$":
+            index += 2
+            continue
+        if index + 1 < len(value) and value[index + 1] == "{":
+            close = value.find("}", index + 2)
+            if close < 0:
+                index += 1
+                continue
+            inner = value[index + 2 : close]
+            separator = inner.find(":-")
+            if separator > 0:
+                name = inner[:separator]
+            else:
+                separator = inner.find("-")
+                name = inner[:separator] if separator > 0 else inner
+            if name:
+                names.add(name)
+            index = close + 1
+            continue
+        end = index + 1
+        while end < len(value) and (
+            value[end].isascii() and (value[end].isalnum() or value[end] == "_")
+        ):
+            end += 1
+        if end > index + 1:
+            names.add(value[index + 1 : end])
+            index = end
+            continue
+        index += 1
+    return names
+
+
 def sensitive_env_names(config_path: Path | str | None = None) -> set[str]:
     """Names that must reach the container as a secret, never as plain-text manifest."""
     return _STATIC_SENSITIVE | config_env_references(config_path)
@@ -160,8 +248,7 @@ def sensitive_env_names(config_path: Path | str | None = None) -> set[str]:
 def append_passthrough_env_vars(
     env_vars: dict[str, str], config_path: Path | str | None = None
 ) -> None:
-    """Pass selected host environment variables into the container runtime."""
-    # Static rules first so their masking wins; sorted for a stable log order.
+    """Pass established host variables for an operator-trusted source config."""
     discovered = ((name, True) for name in sorted(config_env_references(config_path)))
     for name, masked in chain(PASSTHROUGH_ENV_RULES, discovered):
         if name in env_vars:
@@ -172,6 +259,76 @@ def append_passthrough_env_vars(
         env_vars[name] = value
         logged_value = "***" if masked else value
         log.info(f"Passing environment variable: {name}={logged_value}")
+
+
+def normalize_recipe_env_names(names: Iterable[str]) -> tuple[str, ...]:
+    """Validate, deduplicate, and stabilize explicit Recipe env bindings."""
+
+    normalized: set[str] = set()
+    for value in names:
+        name = str(value).strip()
+        if not name or not _ENV_NAME.fullmatch(name) or name in _DISCOVERY_DENYLIST:
+            raise ValueError(
+                f"Invalid Recipe environment binding name: {name or '<empty>'}. "
+                "Use an uppercase environment variable name, without NAME=value."
+            )
+        normalized.add(name)
+    return tuple(sorted(normalized))
+
+
+def configure_recipe_env_bindings(
+    env_vars: dict[str, str], requested_names: Iterable[str]
+) -> tuple[str, ...]:
+    """Bind only operator-authorized host variables for Recipes.
+
+    The names-only allowlist is safe to expose to the Dashboard. Values are
+    never accepted on the command line and never included in log messages.
+    """
+
+    names = list(requested_names)
+    configured_allowlist = os.getenv(RECIPE_ENV_ALLOWLIST_ENV, "").strip()
+    if configured_allowlist:
+        raw_names = configured_allowlist.split(",")
+        if any(not raw.strip() for raw in raw_names):
+            raise ValueError(
+                f"{RECIPE_ENV_ALLOWLIST_ENV} must be a comma-separated list of names"
+            )
+        names.extend(raw_names)
+
+    normalized = normalize_recipe_env_names(names)
+    missing = [name for name in normalized if not os.getenv(name)]
+    if missing:
+        raise ValueError(
+            "Recipe environment binding has no non-empty host value: "
+            + ", ".join(missing)
+        )
+
+    env_vars[RECIPE_ENV_ALLOWLIST_ENV] = ",".join(normalized)
+    for name in normalized:
+        env_vars[name] = os.environ[name]
+        log.info("Binding Recipe environment variable: %s=***", name)
+    return normalized
+
+
+def validate_config_recipe_env_bindings(
+    config_path: Path | str, allowed_names: Iterable[str]
+) -> None:
+    """Require every active config dependency to be explicitly authorized."""
+
+    required = required_config_env_references(config_path)
+    try:
+        normalized_required = set(normalize_recipe_env_names(required))
+    except ValueError as exc:
+        raise ValueError(
+            "Active config contains an invalid Recipe environment binding"
+        ) from exc
+    missing = sorted(normalized_required - set(allowed_names))
+    if missing:
+        flags = " ".join(f"--recipe-env {name}" for name in missing)
+        raise ValueError(
+            "Active config requires explicit Recipe environment bindings: "
+            f"{', '.join(missing)}. Restart serve with {flags}."
+        )
 
 
 def apply_container_runtime_override(runtime: str | None) -> None:
@@ -243,14 +400,22 @@ def apply_runtime_mode_env_vars(
         log.info(f"Router log level: {normalized_log_level}")
 
 
-def resolve_effective_config_path(
-    config_path: Path, algorithm: str | None, setup_mode: bool, platform: str | None
-) -> Path:
-    """Apply CLI algorithm and platform override translation when appropriate."""
+def _resolve_effective_config_document(
+    config_path: Path,
+    algorithm: str | None,
+    setup_mode: bool,
+    platform: str | None,
+    *,
+    package_activation: bool = False,
+) -> tuple[dict[str, object], bool]:
     with config_path.open() as handle:
         config = yaml.safe_load(handle) or {}
 
-    kb_runtime_required, changed = _sync_runtime_kb_store(config, config_path)
+    if package_activation:
+        _validate_package_kb_paths(config)
+        kb_runtime_required, changed = False, False
+    else:
+        kb_runtime_required, changed = _sync_runtime_kb_store(config, config_path)
     if not setup_mode:
         stack = resolve_runtime_stack()
         changed = inject_local_service_runtime_defaults(config, stack) or changed
@@ -264,16 +429,83 @@ def resolve_effective_config_path(
         and not apply_gpu_defaults
         and not changed
     ):
-        return config_path
+        return config, False
 
     if normalized_algorithm:
         changed = _apply_algorithm_override(config, normalized_algorithm) or changed
 
     changed = apply_platform_gpu_defaults(config, platform) or changed
+    return config, changed or kb_runtime_required
+
+
+def build_effective_config_bytes(
+    config_path: Path,
+    algorithm: str | None,
+    setup_mode: bool,
+    platform: str | None,
+    *,
+    package_activation: bool = False,
+) -> bytes:
+    """Build the effective runtime config without touching active runtime state."""
+
+    config, changed = _resolve_effective_config_document(
+        config_path,
+        algorithm,
+        setup_mode,
+        platform,
+        package_activation=package_activation,
+    )
+    if not changed:
+        return config_path.read_bytes()
+    return yaml.dump(config, default_flow_style=False, sort_keys=False).encode("utf-8")
+
+
+def realize_runtime_config(
+    source_path: Path,
+    target_path: Path,
+    *,
+    algorithm: str | None = None,
+    platform: str | None = None,
+    package_activation: bool = False,
+) -> Path:
+    """Realize one raw package config at an explicit runtime-owned path.
+
+    The raw source is never changed. Runtime defaults and current CLI
+    algorithm/platform transforms are applied before a strict atomic replace of
+    ``target_path``.
+    """
+
+    if algorithm is None:
+        algorithm = os.getenv(RUNTIME_ALGORITHM_OVERRIDE_ENV, "").strip() or None
+    if platform is None:
+        platform = (
+            os.getenv("VLLM_SR_PLATFORM", "").strip()
+            or os.getenv("DASHBOARD_PLATFORM", "").strip()
+            or None
+        )
+
+    effective = build_effective_config_bytes(
+        source_path,
+        algorithm=algorithm,
+        setup_mode=is_setup_mode_config(source_path),
+        platform=platform,
+        package_activation=package_activation,
+    )
+    return write_runtime_config_bytes(target_path, effective)
+
+
+def resolve_effective_config_path(
+    config_path: Path, algorithm: str | None, setup_mode: bool, platform: str | None
+) -> Path:
+    """Apply CLI algorithm and platform override translation when appropriate."""
+
+    config, changed = _resolve_effective_config_document(
+        config_path, algorithm, setup_mode, platform
+    )
     return _finalize_runtime_config_write(
         config_path,
         config,
-        changed or kb_runtime_required,
+        changed,
     )
 
 
@@ -293,16 +525,26 @@ def configure_runtime_override_env_vars(
     env_vars: dict[str, str],
     source_config_path: Path,
     effective_config_path: Path,
+    *,
+    runtime_owned: bool = True,
 ) -> None:
-    """Expose the runtime-only config path to the container when overrides exist."""
-    env_vars[SOURCE_CONFIG_PATH_ENV] = _container_source_config_path()
-
-    if source_config_path.resolve() != effective_config_path.resolve() or env_vars.get(
-        RUNTIME_ALGORITHM_OVERRIDE_ENV
-    ):
-        env_vars[RUNTIME_CONFIG_PATH_ENV] = _container_runtime_config_path(
-            source_config_path
-        )
+    """Expose source and runtime-owned config paths inside local containers."""
+    if not runtime_owned:
+        env_vars[SOURCE_CONFIG_PATH_ENV] = "/app/config.yaml"
+        if (
+            source_config_path.resolve() != effective_config_path.resolve()
+            or env_vars.get(RUNTIME_ALGORITHM_OVERRIDE_ENV)
+        ):
+            env_vars[RUNTIME_CONFIG_PATH_ENV] = _container_runtime_config_path(
+                source_config_path
+            )
+        else:
+            env_vars.pop(RUNTIME_CONFIG_PATH_ENV, None)
         return
 
-    env_vars.pop(RUNTIME_CONFIG_PATH_ENV, None)
+    container_runtime_path = _container_runtime_config_path(source_config_path)
+    # This env is the Router/Dashboard persistence source, not a provenance
+    # hint. Keep mutations on the runtime-owned active file; the original
+    # source is separately mounted read-only for inspection.
+    env_vars[SOURCE_CONFIG_PATH_ENV] = container_runtime_path
+    env_vars[RUNTIME_CONFIG_PATH_ENV] = container_runtime_path

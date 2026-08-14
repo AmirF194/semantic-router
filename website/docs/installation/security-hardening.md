@@ -197,6 +197,24 @@ Three new permissions were added to the dashboard RBAC system:
 The `security.manage` permission is required for `PUT` and `POST` requests
 to `/api/security/*` endpoints. `GET` requests only require `config.read`.
 
+The Router management API separately distinguishes `replay.read` from
+`replay.detail`. The Dashboard's managed service identity receives both narrow
+Router permissions so it can proxy complete records; the Dashboard then applies
+its own user authorization and removes captured bodies and tool payloads unless
+the signed-in user has `config.write`. The service identity does not receive
+`secret_view`.
+
+## Dashboard container-runtime socket
+
+Managed Recipe topology and OpenClaw operations use the container runtime
+socket mounted at `/var/run/docker.sock`. Before dropping root, the Dashboard
+entrypoint validates that mount as a Unix socket, maps its numeric GID inside
+the image, and adds the `nonroot` account to that group. A conventional
+`0660 root:docker` socket therefore remains usable without broadening its
+mode. Do not make the socket world-writable. Use `VLLM_SR_CONTAINER_SOCKET`
+for a non-default socket; rootless Podman deployments must separately qualify
+their user-namespace and supplementary-group mapping.
+
 ## Deployment Checklist
 
 For production multi-user deployments:
@@ -206,5 +224,11 @@ For production multi-user deployments:
 - [ ] Set `ratelimit.fail_open: false` for strict enforcement
 - [ ] Configure role-to-model mappings to restrict model access by group
 - [ ] Review dashboard user roles — only admins should have `security.manage`
+- [ ] Verify public inference listeners return `404` for `/v1/router_replay*`;
+      access replay records only through the authenticated management API
+- [ ] Verify Router ExtProc, metrics, and management ports and every managed
+      Redis, Postgres, or Milvus host port bind only to loopback. The CLI
+      refuses to reuse a running storage container with a public host binding;
+      preserve its mounts and recreate it explicitly before serving.
 - [ ] Ensure the looper endpoint is only accessible from the router container
       (network-level isolation)

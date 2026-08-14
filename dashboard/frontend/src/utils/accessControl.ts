@@ -93,6 +93,7 @@ export function canAccessDashboardPath(
   }
   if (
     normalizedPath.startsWith('/status') ||
+    normalizedPath.startsWith('/plugins') ||
     normalizedPath.startsWith('/response-cache') ||
     normalizedPath.startsWith('/context-compression') ||
     normalizedPath.startsWith('/logs') ||

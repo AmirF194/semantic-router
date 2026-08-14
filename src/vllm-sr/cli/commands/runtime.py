@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import webbrowser
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import click
 
 from cli.bootstrap import (
     ensure_bootstrap_workspace,
+    is_setup_mode_config,
 )
 from cli.commands.common import exit_with_logged_error
 from cli.commands.runtime_config_mutation import (
@@ -18,13 +20,20 @@ from cli.commands.runtime_config_mutation import (
     inject_algorithm_into_config as _inject_algorithm_into_config,
 )
 from cli.commands.runtime_help import SERVE_HELP
+from cli.commands.runtime_paths import (
+    _runtime_config_output_path,
+    materialize_runtime_config,
+)
 from cli.commands.runtime_support import (
     append_passthrough_env_vars,
     apply_container_runtime_override,
     apply_runtime_mode_env_vars,
+    build_effective_config_bytes,
+    configure_recipe_env_bindings,
     configure_runtime_override_env_vars,
     log_bootstrap_result,
     resolve_effective_config_path,
+    validate_config_recipe_env_bindings,
     validate_setup_mode_flags,
 )
 from cli.consts import (
@@ -35,7 +44,14 @@ from cli.consts import (
     SUPPORTED_CONTAINER_RUNTIMES,
     VLLM_SR_CONTAINER_IMAGE_DEFAULT,
 )
+from cli.container_services import container_status_strict
 from cli.deployment_backend import DEFAULT_TARGET, VALID_TARGETS, resolve_target
+from cli.recipe_activation_recovery import (
+    active_recipe_package_for_stack,
+    recover_pending_recipe_activation_for_stack,
+)
+from cli.runtime_config_lock import acquire_runtime_config_lock
+from cli.runtime_stack import resolve_runtime_stack
 from cli.utils import get_logger
 
 log = get_logger(__name__)
@@ -70,6 +86,61 @@ def _build_backend(target: str | None, **k8s_kwargs):
     return ContainerBackend()
 
 
+def _prepare_docker_runtime_config(
+    config_path: Path,
+    algorithm: str | None,
+    source_setup_mode: bool,
+    platform: str | None,
+    recipe_env_bindings: tuple[str, ...],
+):
+    stack_layout = resolve_runtime_stack()
+    state_root_dir = (
+        Path(os.environ["VLLM_SR_STATE_ROOT_DIR"]).expanduser().absolute()
+        if os.getenv("VLLM_SR_STATE_ROOT_DIR", "").strip()
+        else config_path.expanduser().absolute().parent
+    )
+    effective_config_path = _runtime_config_output_path(
+        config_path,
+        state_root_dir=state_root_dir,
+        stack_name=stack_layout.stack_name,
+    )
+    runtime_lock = acquire_runtime_config_lock(
+        runtime_config_path=effective_config_path,
+        state_root_dir=state_root_dir,
+        stack_name=stack_layout.stack_name,
+    )
+    try:
+        recover_pending_recipe_activation_for_stack(
+            runtime_config_path=effective_config_path,
+            state_root_dir=state_root_dir,
+            stack_name=stack_layout.stack_name,
+            managed_container_names=stack_layout.runtime_container_names,
+            status_provider=container_status_strict,
+        )
+        package_active = active_recipe_package_for_stack(
+            state_root_dir=state_root_dir, stack_name=stack_layout.stack_name
+        )
+        if package_active:
+            validate_config_recipe_env_bindings(
+                effective_config_path, recipe_env_bindings
+            )
+        else:
+            effective_config_bytes = build_effective_config_bytes(
+                config_path, algorithm, source_setup_mode, platform
+            )
+            effective_config_path = materialize_runtime_config(
+                config_path,
+                effective_config_bytes,
+                state_root_dir=state_root_dir,
+                stack_name=stack_layout.stack_name,
+            )
+        setup_mode = is_setup_mode_config(effective_config_path)
+        return effective_config_path, setup_mode, runtime_lock
+    except Exception:
+        runtime_lock.close()
+        raise
+
+
 def _execute_serve(
     config: str,
     image: str | None,
@@ -89,56 +160,87 @@ def _execute_serve(
     profile: str | None,
     chart_dir: str | None,
     runtime: str | None,
+    recipe_env_names: tuple[str, ...] = (),
 ) -> None:
     """Bootstrap workspace, resolve config, and delegate to the deployment backend."""
     apply_container_runtime_override(runtime)
     requested_config = config
     bootstrap = ensure_bootstrap_workspace(Path(config))
     config_path = bootstrap.config_path
-    setup_mode = bootstrap.setup_mode
+    source_setup_mode = bootstrap.setup_mode
 
     log_bootstrap_result(requested_config, bootstrap)
     log.info(f"Using config file: {config_path}")
 
-    validate_setup_mode_flags(setup_mode, minimal, readonly)
-
     env_vars: dict[str, str] = {}
     append_passthrough_env_vars(env_vars, config_path)
-    apply_runtime_mode_env_vars(
-        env_vars,
-        minimal,
-        readonly,
-        setup_mode,
-        platform,
-        algorithm,
-        log_level=log_level,
-    )
+    recipe_env_bindings = configure_recipe_env_bindings(env_vars, recipe_env_names)
 
-    effective_config_path = resolve_effective_config_path(
-        config_path, algorithm, setup_mode, platform
-    )
-    configure_runtime_override_env_vars(env_vars, config_path, effective_config_path)
+    resolved_target = resolve_target(target)
+    if resolved_target != "docker" and recipe_env_bindings:
+        raise ValueError(
+            "--recipe-env is supported only for local Docker Recipe packages"
+        )
+    runtime_lock = None
+    try:
+        if resolved_target == "docker":
+            effective_config_path, setup_mode, runtime_lock = (
+                _prepare_docker_runtime_config(
+                    config_path,
+                    algorithm,
+                    source_setup_mode,
+                    platform,
+                    recipe_env_bindings,
+                )
+            )
+        else:
+            # Kubernetes remains a deployment translation flow. Its effective
+            # local file is not a Dashboard-owned persistent runtime workspace.
+            effective_config_path = resolve_effective_config_path(
+                config_path, algorithm, source_setup_mode, platform
+            )
+            setup_mode = source_setup_mode
+        validate_setup_mode_flags(setup_mode, minimal, readonly)
+        apply_runtime_mode_env_vars(
+            env_vars,
+            minimal,
+            readonly,
+            setup_mode,
+            platform,
+            algorithm,
+            log_level=log_level,
+        )
+        configure_runtime_override_env_vars(
+            env_vars,
+            config_path,
+            effective_config_path,
+            runtime_owned=resolved_target == "docker",
+        )
 
-    backend = _build_backend(
-        target,
-        namespace=namespace,
-        context=context,
-        profile=profile,
-        chart_dir=chart_dir,
-    )
-    backend.deploy(
-        config_file=str(effective_config_path.absolute()),
-        source_config_file=str(config_path.absolute()),
-        runtime_config_file=str(effective_config_path.absolute()),
-        env_vars=env_vars,
-        image=image,
-        router_image=router_image,
-        envoy_image=envoy_image,
-        dashboard_image=dashboard_image,
-        sim_image=sim_image,
-        pull_policy=image_pull_policy,
-        enable_observability=not minimal,
-    )
+        backend = _build_backend(
+            resolved_target,
+            namespace=namespace,
+            context=context,
+            profile=profile,
+            chart_dir=chart_dir,
+        )
+        backend.deploy(
+            config_file=str(effective_config_path.absolute()),
+            source_config_file=str(config_path.absolute()),
+            runtime_config_file=str(effective_config_path.absolute()),
+            runtime_config_lock=runtime_lock,
+            env_vars=env_vars,
+            image=image,
+            router_image=router_image,
+            envoy_image=envoy_image,
+            dashboard_image=dashboard_image,
+            sim_image=sim_image,
+            pull_policy=image_pull_policy,
+            enable_observability=not minimal,
+        )
+    finally:
+        if runtime_lock is not None:
+            runtime_lock.close()
 
 
 @click.command(help=SERVE_HELP)
@@ -245,6 +347,16 @@ def _execute_serve(
     default=None,
     help=RUNTIME_HELP,
 )
+@click.option(
+    "--recipe-env",
+    "recipe_env_names",
+    multiple=True,
+    metavar="NAME",
+    help=(
+        "Explicitly bind one host environment variable for the active Recipe. "
+        "Repeat for multiple names; NAME=value is rejected."
+    ),
+)
 @exit_with_logged_error(log, interrupt_message="\nInterrupted by user")
 def serve(
     config: str,
@@ -265,6 +377,7 @@ def serve(
     profile: str | None,
     chart_dir: str | None,
     runtime: str | None,
+    recipe_env_names: tuple[str, ...],
 ) -> None:
     _execute_serve(
         config,
@@ -285,6 +398,7 @@ def serve(
         profile,
         chart_dir,
         runtime,
+        recipe_env_names,
     )
 
 

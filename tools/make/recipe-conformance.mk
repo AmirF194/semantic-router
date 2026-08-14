@@ -19,6 +19,11 @@ recipe-conformance-static: ## Validate all maintained recipe assets and probe co
 	@$(RECIPE_CONFORMANCE_PYTHON) tools/agent/scripts/recipe_conformance.py \
 		--output-dir "$(RECIPE_CONFORMANCE_REPORT_DIR)" \
 		static
+	@$(RECIPE_CONFORMANCE_PYTHON) tools/agent/scripts/recipe_conformance.py \
+		--recipes-root "$(CURDIR)/config/built-in/latest" \
+		--output-dir "$(RECIPE_CONFORMANCE_REPORT_DIR)/built-in/latest" \
+		--skip-catalog-readme \
+		static
 	@cd src/semantic-router && go test \
 		./pkg/config/... \
 		./pkg/dsl/... \

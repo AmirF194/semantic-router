@@ -435,12 +435,14 @@ def _reject_invalid_config_surfaces(data: Dict[str, Any], config_path: str) -> N
         )
 
 
-def parse_user_config(config_path: str) -> UserConfig:
+def parse_user_config(config_path: str, *, log_summary: bool = True) -> UserConfig:
     """
     Parse and validate user configuration file.
 
     Args:
         config_path: Path to config.yaml
+        log_summary: Emit the human-readable parse summary. Machine-readable
+            callers disable this so stdout remains a valid document.
 
     Returns:
         UserConfig: Validated user configuration
@@ -471,21 +473,22 @@ def parse_user_config(config_path: str) -> UserConfig:
     # Validate with Pydantic
     try:
         config = UserConfig(**data)
-        log.info("Configuration parsed successfully")
-        log.info(f"  Version: {config.version}")
-        log.info(f"  Listeners: {len(config.listeners)}")
-        recipe_decisions = sum(
-            len(profile.decisions)
-            for name, profile in iter_routing_profiles(config)
-            if name != "default"
-        )
-        log.info(f"  Entrypoints: {len(config.entrypoints)}")
-        log.info(f"  Recipes: {len(config.recipes)}")
-        log.info(
-            f"  Decisions: {len(config.decisions) + recipe_decisions} total "
-            f"({len(config.decisions)} default, {recipe_decisions} recipe-owned)"
-        )
-        log.info(f"  Models: {len(config.providers.models)}")
+        if log_summary:
+            log.info("Configuration parsed successfully")
+            log.info(f"  Version: {config.version}")
+            log.info(f"  Listeners: {len(config.listeners)}")
+            recipe_decisions = sum(
+                len(profile.decisions)
+                for name, profile in iter_routing_profiles(config)
+                if name != "default"
+            )
+            log.info(f"  Entrypoints: {len(config.entrypoints)}")
+            log.info(f"  Recipes: {len(config.recipes)}")
+            log.info(
+                f"  Decisions: {len(config.decisions) + recipe_decisions} total "
+                f"({len(config.decisions)} default, {recipe_decisions} recipe-owned)"
+            )
+            log.info(f"  Models: {len(config.providers.models)}")
         return config
     except ValidationError as e:
         # Format validation errors nicely

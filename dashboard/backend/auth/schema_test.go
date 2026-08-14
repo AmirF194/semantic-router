@@ -58,7 +58,7 @@ func TestReadRoleDoesNotHaveSecurityManage(t *testing.T) {
 	}
 }
 
-func TestAllRolesHaveFeedbackSubmitAndReplayRead(t *testing.T) {
+func TestWriteRolesHaveFeedbackSubmitAndAllRolesHaveReplayRead(t *testing.T) {
 	t.Parallel()
 
 	for _, role := range SupportedRoles {
@@ -73,8 +73,8 @@ func TestAllRolesHaveFeedbackSubmitAndReplayRead(t *testing.T) {
 				hasReplay = true
 			}
 		}
-		if !hasFeedback {
-			t.Fatalf("role %q should have %q permission", role, PermFeedbackSubmit)
+		if hasFeedback != (role != RoleRead) {
+			t.Fatalf("role %q feedback permission = %v", role, hasFeedback)
 		}
 		if !hasReplay {
 			t.Fatalf("role %q should have %q permission", role, PermReplayRead)

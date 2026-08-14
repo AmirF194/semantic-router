@@ -206,7 +206,9 @@ def maybe_finish_setup_mode(
     return True
 
 
-def wait_for_router_health(stack_layout: RuntimeStackLayout) -> None:
+def wait_for_router_health(
+    stack_layout: RuntimeStackLayout, management_port: int = DEFAULT_API_PORT
+) -> None:
     """Block until the router readiness endpoint responds or the timeout elapses."""
     log.info("Waiting for Router to become ready...")
     log.info(f"Health check timeout: {HEALTH_CHECK_TIMEOUT}s")
@@ -234,7 +236,7 @@ def wait_for_router_health(stack_layout: RuntimeStackLayout) -> None:
 
         return_code, _stdout, _stderr = container_exec(
             router_container,
-            ["curl", "-f", "-s", f"http://localhost:{DEFAULT_API_PORT}/ready"],
+            ["curl", "-f", "-s", f"http://localhost:{management_port}/ready"],
         )
         if return_code == 0:
             elapsed = int(time.time() - start_time)

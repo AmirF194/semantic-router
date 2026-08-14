@@ -243,6 +243,8 @@ go run ./cmd/dsl validate ../../config/recipes/balance/recipe.dsl
 Then run the repo-native routing calibration loop against a live router:
 
 ```bash
+# Required only when management_api.auth.mode is bearer.
+export VSR_MGMT_TOKEN="<scoped-management-token>"
 python3 tools/agent/scripts/router_calibration_loop.py run \
   --router-url http://<router-host>:8080 \
   --probes config/recipes/balance/probes.yaml \

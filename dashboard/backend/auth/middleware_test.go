@@ -178,6 +178,7 @@ func TestRequiredPermission(t *testing.T) {
 		{method: http.MethodGet, path: "/embedded/wizmap/", expected: PermConfigRead},
 		{method: http.MethodPost, path: "/api/setup/activate", expected: PermConfigWrite},
 		{method: http.MethodPost, path: "/api/setup/import-remote", expected: PermConfigWrite},
+		{method: http.MethodGet, path: "/api/models/catalog", expected: PermConfigRead},
 		{method: http.MethodGet, path: "/api/mcp/servers", expected: PermMcpRead},
 		{method: http.MethodPost, path: "/api/mcp/servers", expected: PermMcpManage},
 		{method: http.MethodDelete, path: "/api/mcp/servers/server-1/status", expected: PermMcpManage},
@@ -185,6 +186,10 @@ func TestRequiredPermission(t *testing.T) {
 		{method: http.MethodPost, path: "/api/router/config/deploy", expected: PermConfigDeploy},
 		{method: http.MethodPost, path: "/api/router/config/deploy/preview", expected: PermConfigDeploy},
 		{method: http.MethodGet, path: "/api/router/config/deployments", expected: PermConfigRead},
+		{method: http.MethodGet, path: "/api/router/api/v1/response-cache/stats", expected: PermConfigRead},
+		{method: http.MethodPost, path: "/api/router/api/v1/response-cache/invalidate", expected: PermConfigWrite},
+		{method: http.MethodPost, path: "/api/router/api/v1/context-compression/preview", expected: PermConfigRead},
+		{method: http.MethodPost, path: "/api/router/api/v1/context-compression/recovery/invalidate", expected: PermConfigWrite},
 		{method: http.MethodPost, path: "/api/evaluation/tasks", expected: PermEvalWrite},
 		{method: http.MethodPost, path: "/api/evaluation/run", expected: PermEvalRun},
 		{method: http.MethodPost, path: "/api/evaluation/cancel/task-1", expected: PermEvalRun},
@@ -194,6 +199,29 @@ func TestRequiredPermission(t *testing.T) {
 		{method: http.MethodPost, path: "/api/openclaw/teams", expected: PermOpenClaw},
 		{method: http.MethodPost, path: "/api/openclaw/rooms/room-1/messages", expected: PermOpenClawRead},
 		{method: http.MethodPost, path: "/api/router/v1/chat/completions", expected: PermConfigRead},
+		{method: http.MethodPost, path: "/api/router/v1/router/outcomes", expected: PermFeedbackSubmit},
+		{method: http.MethodGet, path: "/api/router/v1/router_replay", expected: PermReplayRead},
+		{method: http.MethodGet, path: "/api/router/v1/router_replay/record-1", expected: PermReplayRead},
+		{method: http.MethodGet, path: "/api/recipe", expected: PermConfigRead},
+		{method: http.MethodGet, path: "/api/recipe/probes", expected: PermConfigRead},
+		{method: http.MethodGet, path: "/api/recipe/packages", expected: PermConfigRead},
+		{method: http.MethodGet, path: "/api/recipe/packages/", expected: PermConfigRead},
+		{method: http.MethodGet, path: "/api/recipe/packages/anything", expected: PermConfigRead},
+		{method: http.MethodPost, path: "/api/recipe/import", expected: PermConfigWrite},
+		{method: http.MethodPost, path: "/api/recipe/import/", expected: PermConfigWrite},
+		{method: http.MethodPost, path: "/api/recipe/import/anything", expected: PermConfigWrite},
+		{method: http.MethodPost, path: "/api/recipe/activate", expected: PermConfigDeploy},
+		{method: http.MethodPost, path: "/api/recipe/activate/preview", expected: PermConfigDeploy},
+		{method: http.MethodPost, path: "/api/recipe/activate/", expected: PermConfigDeploy},
+		{method: http.MethodPost, path: "/api/recipe/activate/anything", expected: PermConfigDeploy},
+		{method: http.MethodPost, path: "/api/recipe/deactivate", expected: PermConfigDeploy},
+		{method: http.MethodPost, path: "/api/recipe/deactivate/preview", expected: PermConfigDeploy},
+		{method: http.MethodPost, path: "/api/recipe/deactivate/", expected: PermConfigDeploy},
+		{method: http.MethodPost, path: "/api/recipe/deactivate/anything", expected: PermConfigDeploy},
+		{method: http.MethodPost, path: "/api/recipe/probes/lane/variant/run-plan", expected: PermConfigRead},
+		{method: http.MethodPost, path: "/api/recipe/probes/lane/variant/validate", expected: PermTopologyRead},
+		{method: http.MethodPost, path: "/api/recipe/probes/lane/variant/validate/", expected: PermTopologyRead},
+		{method: http.MethodPost, path: "/api/recipe/probes/lane/variant/validate///", expected: PermTopologyRead},
 		{method: http.MethodGet, path: "/api/security/policy", expected: PermConfigRead},
 		{method: http.MethodPut, path: "/api/security/policy", expected: PermSecurityManage},
 		{method: http.MethodPost, path: "/api/security/policy/preview", expected: PermSecurityManage},
@@ -206,5 +234,36 @@ func TestRequiredPermission(t *testing.T) {
 				t.Fatalf("RequiredPermission(%q, %q) = %q, want %q", tc.method, tc.path, actual, tc.expected)
 			}
 		})
+	}
+}
+
+func TestAuthenticateRequestRequiresFeedbackPermissionForRouterOutcomes(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestAuthService(t)
+	reader := newTestUser(t, svc, "outcome-reader@example.com", RoleRead, "active")
+	writer := newTestUser(t, svc, "outcome-writer@example.com", RoleWrite, "active")
+	nextCalled := false
+	handler := AuthenticateRequest(svc)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	readerRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		readerRecorder,
+		newAuthenticatedRequest(t, svc, reader, http.MethodPost, "/api/router/v1/router/outcomes", `{}`),
+	)
+	if readerRecorder.Code != http.StatusForbidden || nextCalled {
+		t.Fatalf("read role status = %d, next called = %v", readerRecorder.Code, nextCalled)
+	}
+
+	writerRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		writerRecorder,
+		newAuthenticatedRequest(t, svc, writer, http.MethodPost, "/api/router/v1/router/outcomes", `{}`),
+	)
+	if writerRecorder.Code != http.StatusNoContent || !nextCalled {
+		t.Fatalf("feedback role status = %d, next called = %v", writerRecorder.Code, nextCalled)
 	}
 }

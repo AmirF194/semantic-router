@@ -4,43 +4,19 @@ from pathlib import Path
 
 import pytest
 import yaml
-from cli.bootstrap import build_bootstrap_config
 from cli.commands.runtime_support import (
     append_passthrough_env_vars,
     apply_runtime_mode_env_vars,
     config_env_references,
+    configure_recipe_env_bindings,
     configure_runtime_override_env_vars,
+    required_config_env_references,
     resolve_effective_config_path,
     sensitive_env_names,
+    validate_config_recipe_env_bindings,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-
-
-@pytest.fixture
-def write_local_looper_config(tmp_path: Path):
-    def _write(endpoint: str | None = None) -> Path:
-        looper = {} if endpoint is None else {"endpoint": endpoint}
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text(
-            yaml.safe_dump(
-                {
-                    "version": "v0.3",
-                    "listeners": [
-                        {
-                            "name": "http-generic",
-                            "address": "0.0.0.0",
-                            "port": 9011,
-                        }
-                    ],
-                    "global": {"integrations": {"looper": looper}},
-                },
-                sort_keys=False,
-            )
-        )
-        return config_path
-
-    return _write
 
 
 def test_runtime_support_import_does_not_load_optional_cli_dependencies():
@@ -113,10 +89,10 @@ def test_append_passthrough_env_vars_includes_router_logging_settings(monkeypatc
     assert env_vars["SR_LOG_ENCODING"] == "console"
 
 
-def test_append_passthrough_env_vars_forwards_keys_named_by_the_config(
+def test_append_passthrough_env_vars_forwards_keys_named_by_trusted_source_config(
     monkeypatch, tmp_path
 ):
-    """api_key_env is free-form, so a provider key outside the static rules must still reach the container."""
+    """Operator-selected source config retains its established passthrough behavior."""
     config = tmp_path / "config.yaml"
     config.write_text(
         yaml.safe_dump(
@@ -150,6 +126,8 @@ def test_config_env_references_reads_api_key_env_and_interpolations(tmp_path):
                 "providers": {"models": [{"api_key_env": "MISTRAL_API_KEY"}]},
                 "embedding_models": {"endpoint": {"api_key_env": "EMBEDDING_API_KEY"}},
                 "note": "uses ${REDIS_AUTH_TOKEN} at runtime",
+                "bare": "postgres://$DATABASE_PASSWORD@db",
+                "fallback": "${OPTIONAL_TOKEN:-development}",
             }
         )
     )
@@ -158,9 +136,78 @@ def test_config_env_references_reads_api_key_env_and_interpolations(tmp_path):
         "MISTRAL_API_KEY",
         "EMBEDDING_API_KEY",
         "REDIS_AUTH_TOKEN",
+        "OPTIONAL_TOKEN",
     }
     assert config_env_references(None) == set()
     assert config_env_references(tmp_path / "missing.yaml") == set()
+
+
+def test_required_config_env_references_includes_every_router_consulted_name(
+    tmp_path: Path,
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "provider": {"api_key_env": "PROVIDER_API_KEY"},
+                "database": "postgres://$DATABASE_PASSWORD@db",
+                "cache": "${CACHE_PASSWORD}",
+                "optional": "${OPTIONAL_TOKEN:-development}",
+                "unset_only": "${UNSET_ONLY_TOKEN-development}",
+                "lowercase": "$lowercase_token",
+                "escaped": "$$NOT_CONSULTED",
+            }
+        )
+    )
+
+    assert required_config_env_references(config) == {
+        "PROVIDER_API_KEY",
+        "DATABASE_PASSWORD",
+        "CACHE_PASSWORD",
+        "OPTIONAL_TOKEN",
+        "UNSET_ONLY_TOKEN",
+        "lowercase_token",
+    }
+
+
+def test_required_package_env_references_fail_closed_on_denied_host_names(
+    tmp_path: Path,
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "provider": {"api_key_env": "HOME"},
+                "path": "${PATH}",
+            }
+        )
+    )
+
+    assert required_config_env_references(config) == {"HOME", "PATH"}
+    with pytest.raises(ValueError, match="invalid Recipe environment binding"):
+        validate_config_recipe_env_bindings(config, [])
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "${lowercase_token}",
+        "${lowercase-token}",
+        "${PATH:-/usr/bin}",
+        "${VLLM_SR_RECIPE_STORE_DIR}",
+        "${VLLM_SR_MANAGED_STORAGE_BACKENDS-default}",
+        "$VLLM_SR_STACK_NAME",
+        "${VLLM_SR_ACTIVE_RECIPE_DIR}",
+    ],
+)
+def test_required_package_env_references_reject_invalid_or_reserved_names(
+    tmp_path: Path, reference: str
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"value": reference}))
+
+    with pytest.raises(ValueError, match="invalid Recipe environment binding"):
+        validate_config_recipe_env_bindings(config, [])
 
 
 def test_config_env_references_excludes_process_identity_vars(tmp_path):
@@ -213,6 +260,91 @@ def test_sensitive_env_names_covers_config_named_credentials(tmp_path):
     assert "HF_TOKEN" in sensitive_env_names(config)
     assert "HF_ENDPOINT" not in sensitive_env_names(config)
     assert "GEMINI_API_KEY" not in sensitive_env_names(None)
+
+
+def test_configure_recipe_env_bindings_requires_explicit_names_and_masks_values(
+    monkeypatch, caplog
+):
+    monkeypatch.setenv("GEMINI_API_KEY", "gk-test")
+    monkeypatch.setenv("VALKEY_PASSWORD", "vp-test")
+    env_vars: dict[str, str] = {}
+
+    names = configure_recipe_env_bindings(
+        env_vars, ["VALKEY_PASSWORD", "GEMINI_API_KEY", "GEMINI_API_KEY"]
+    )
+
+    assert names == ("GEMINI_API_KEY", "VALKEY_PASSWORD")
+    assert env_vars["VLLM_SR_RECIPE_ENV_ALLOWLIST"] == (
+        "GEMINI_API_KEY,VALKEY_PASSWORD"
+    )
+    assert env_vars["GEMINI_API_KEY"] == "gk-test"
+    assert env_vars["VALKEY_PASSWORD"] == "vp-test"
+    assert "gk-test" not in caplog.text
+    assert "vp-test" not in caplog.text
+
+
+def test_configure_recipe_env_bindings_rejects_values_and_missing_host_env(
+    monkeypatch,
+):
+    monkeypatch.delenv("MISSING_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="without NAME=value"):
+        configure_recipe_env_bindings({}, ["API_KEY=secret"])
+    with pytest.raises(ValueError, match="no non-empty host value"):
+        configure_recipe_env_bindings({}, ["MISSING_API_KEY"])
+
+
+def test_configure_recipe_env_bindings_accepts_names_only_env_allowlist(monkeypatch):
+    monkeypatch.setenv("VLLM_SR_RECIPE_ENV_ALLOWLIST", "SECOND_API_KEY,FIRST_API_KEY")
+    monkeypatch.setenv("FIRST_API_KEY", "first")
+    monkeypatch.setenv("SECOND_API_KEY", "second")
+    env_vars: dict[str, str] = {}
+
+    names = configure_recipe_env_bindings(env_vars, [])
+
+    assert names == ("FIRST_API_KEY", "SECOND_API_KEY")
+    assert env_vars["VLLM_SR_RECIPE_ENV_ALLOWLIST"] == ("FIRST_API_KEY,SECOND_API_KEY")
+
+
+def test_validate_config_recipe_env_bindings_fails_closed(tmp_path: Path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "models": [{"name": "gemini", "api_key_env": "GEMINI_API_KEY"}]
+                },
+                "database": "postgres://$DATABASE_PASSWORD@db",
+                "optional": "${OPTIONAL_TOKEN:-development}",
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="--recipe-env GEMINI_API_KEY"):
+        validate_config_recipe_env_bindings(config, ["DATABASE_PASSWORD"])
+
+    with pytest.raises(ValueError, match="--recipe-env OPTIONAL_TOKEN"):
+        validate_config_recipe_env_bindings(
+            config, ["DATABASE_PASSWORD", "GEMINI_API_KEY"]
+        )
+
+    validate_config_recipe_env_bindings(
+        config, ["DATABASE_PASSWORD", "GEMINI_API_KEY", "OPTIONAL_TOKEN"]
+    )
+
+
+@pytest.mark.parametrize(
+    "reference", ["${OPTIONAL_TOKEN:-development}", "${OPTIONAL_TOKEN-development}"]
+)
+def test_package_restart_fallback_reference_requires_explicit_allowlist(
+    tmp_path: Path, reference: str
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"optional": reference}))
+
+    with pytest.raises(ValueError, match="--recipe-env OPTIONAL_TOKEN"):
+        validate_config_recipe_env_bindings(config, [])
+
+    validate_config_recipe_env_bindings(config, ["OPTIONAL_TOKEN"])
 
 
 def test_resolve_effective_config_path_enables_amd_gpu_by_default(
@@ -565,10 +697,11 @@ def test_configure_runtime_override_env_vars_sets_internal_runtime_path(tmp_path
 
     configure_runtime_override_env_vars(env_vars, source_config, effective_config)
 
-    assert env_vars["VLLM_SR_SOURCE_CONFIG_PATH"] == "/app/config.yaml"
+    assert env_vars["VLLM_SR_SOURCE_CONFIG_PATH"] == "/app/.vllm-sr/runtime-config.yaml"
     assert (
         env_vars["VLLM_SR_RUNTIME_CONFIG_PATH"] == "/app/.vllm-sr/runtime-config.yaml"
     )
+    assert "VLLM_SR_STATE_ROOT_DIR" not in env_vars
 
 
 def test_resolve_effective_config_path_uses_state_root_for_runtime_override(
@@ -613,116 +746,3 @@ def test_resolve_effective_config_path_uses_state_root_for_runtime_override(
     assert (
         env_vars["VLLM_SR_RUNTIME_CONFIG_PATH"] == "/app/.vllm-sr/runtime-config.yaml"
     )
-
-
-def test_resolve_effective_config_path_injects_local_service_runtime_defaults(
-    tmp_path: Path,
-):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "version": "v0.3",
-                "listeners": [
-                    {
-                        "name": "http-8899",
-                        "address": "0.0.0.0",
-                        "port": 8899,
-                    }
-                ],
-            },
-            sort_keys=False,
-        )
-    )
-
-    effective_path = resolve_effective_config_path(
-        config_path=config_path,
-        algorithm=None,
-        setup_mode=False,
-        platform=None,
-    )
-
-    assert effective_path == tmp_path / ".vllm-sr" / "runtime-config.yaml"
-    effective = yaml.safe_load(effective_path.read_text())
-    response_api = effective["global"]["services"]["response_api"]
-    assert response_api["enabled"] is True
-    assert response_api["store_backend"] == "redis"
-    assert response_api["redis"]["address"] == "vllm-sr-redis:6379"
-    assert response_api["redis"]["db"] == 0
-
-    router_replay = effective["global"]["services"]["router_replay"]
-    assert router_replay["enabled"] is True
-    assert router_replay["store_backend"] == "postgres"
-    assert router_replay["postgres"]["host"] == "vllm-sr-postgres"
-    assert router_replay["postgres"]["port"] == 5432
-    assert router_replay["postgres"]["database"] == "vsr"
-    assert router_replay["postgres"]["user"] == "router"
-    assert router_replay["postgres"]["password"] == "router-secret"
-    assert router_replay["postgres"]["ssl_mode"] == "disable"
-
-
-@pytest.mark.parametrize(
-    "endpoint",
-    [
-        None,
-        "http://localhost:8899/v1/chat/completions",
-        "http://127.0.0.2:8899/v1/chat/completions",
-        "http://[::1]:8899/v1/chat/completions",
-    ],
-)
-def test_resolve_effective_config_path_rewrites_local_looper_endpoint(
-    endpoint: str | None,
-    write_local_looper_config,
-    monkeypatch,
-):
-    monkeypatch.setenv("VLLM_SR_STACK_NAME", "test-stack")
-    config_path = write_local_looper_config(endpoint)
-
-    effective_path = resolve_effective_config_path(
-        config_path=config_path,
-        algorithm=None,
-        setup_mode=False,
-        platform=None,
-    )
-
-    effective = yaml.safe_load(effective_path.read_text())
-    assert effective["global"]["integrations"]["looper"]["endpoint"] == (
-        "http://test-stack-vllm-sr-envoy-container:9011/v1/chat/completions"
-    )
-
-
-def test_resolve_effective_config_path_preserves_external_looper_endpoint(
-    write_local_looper_config,
-    monkeypatch,
-):
-    monkeypatch.setenv("VLLM_SR_STACK_NAME", "test-stack")
-    external_endpoint = "https://gateway.example.test/v1/chat/completions"
-    config_path = write_local_looper_config(external_endpoint)
-
-    effective_path = resolve_effective_config_path(
-        config_path=config_path,
-        algorithm=None,
-        setup_mode=False,
-        platform=None,
-    )
-
-    effective = yaml.safe_load(effective_path.read_text())
-    assert (
-        effective["global"]["integrations"]["looper"]["endpoint"] == external_endpoint
-    )
-
-
-def test_resolve_effective_config_path_preserves_setup_mode_bootstrap_config(
-    tmp_path: Path,
-):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(yaml.safe_dump(build_bootstrap_config(), sort_keys=False))
-
-    effective_path = resolve_effective_config_path(
-        config_path=config_path,
-        algorithm=None,
-        setup_mode=True,
-        platform=None,
-    )
-
-    assert effective_path == config_path

@@ -7,8 +7,10 @@
 - `config/fragments/decision/`: reusable `routing.decisions` rule-shape fragments
 - `config/fragments/algorithm/`: reusable `decision.algorithm` snippets
 - `config/fragments/plugin/`: reusable route plugin snippets
-- `config/recipes/`: complete use-case deliveries with symmetric YAML, DSL,
-  Eval API probes, and documentation
+- `config/recipes/`: complete use-case deliveries with versioned identity,
+  symmetric YAML and DSL, Eval API probes, and documentation
+- `config/schemas/`: versioned schemas for managed config assets such as Recipe
+  metadata; these schemas do not add fields to the Router runtime config
 - `config/runtime/`: backend-specific runtime examples referenced by configs
   and tests; these are support assets rather than schema fragments
 
@@ -19,7 +21,11 @@ not change.
 
 Inside canonical `config.yaml`:
 
-- `providers.defaults` holds provider-wide defaults such as `default_model` and reasoning families
+- `providers.defaults` holds provider-wide defaults such as `default_model` and
+  reasoning families. Supported family types are `chat_template_kwargs`,
+  dialect-aware `reasoning_effort`, and `top_level_reasoning_effort`; the last
+  one always emits the canonical top-level `reasoning_effort` field for local
+  providers such as Mistral that reject the chat-template form.
 - `providers.models[]` holds concrete backend access details directly
 - `providers.models[].pricing` supports separate prompt, cached-input, cache-write, and completion rates; omitted `cache_write_per_1m` falls back to `prompt_per_1m`
 - `routing.modelCards[]` holds semantic model metadata, including optional `loras[]` catalogs for decision-level `lora_name` references
@@ -32,6 +38,7 @@ Inside canonical `config.yaml`:
 - `routing.signals.metadata` matches bounded, untrusted caller hints; authenticated identity remains owned by `authz`
 - `routing.signals.classifiers` exposes generic native or constrained-LLM label scores; decisions select a declared label and apply a numeric predicate
 - decision leaves may add `predicate` and `on_error` when they need to gate an exposed signal value rather than only boolean membership
+- confidence algorithms reject unknown methods, escalation orders, token filters, and error policies. Their non-pointer numeric fields use zero as the documented unset sentinel: nonzero thresholds and cost tradeoffs must be in `(0, 1]`, effective hybrid weights must sum to `1`, and verifier settings are valid only for `automix_entailment` with an absolute HTTP(S) URL.
 - `routing.signals.embeddings[].query_modality` declares which modality of incoming request payload the embedding rule's query is computed from. Defaults to `"text"`; `"image"` and `"audio"` require `global.model_catalog.embeddings.semantic.embedding_config.model_type=multimodal` so the query and candidate embeddings land in the same shared space. See `website/docs/tutorials/signal/learned/embedding.md` for the worked multimodal example.
 - structure `density` features now use built-in multilingual text-unit normalization; the contract no longer exposes a per-rule `normalize_by` switch
 - the dashboard and DSL builder now expose the same projection surface directly; see `website/docs/tutorials/projection/overview.md` and the maintained `config/recipes/balance/` delivery for end-to-end usage
@@ -40,7 +47,7 @@ Inside canonical `config.yaml`:
 - `global.router`, `global.services`, `global.stores`, `global.integrations`, and `global.model_catalog` expose router-wide overrides explicitly
 - `global.router.learning.adaptation` adds online model-choice learning after the base decision algorithm. `global.router.learning.protection` protects agentic continuity, cache, tool loops, and handoff cost. Decisions can opt out with `routing.decisions[].adaptations.mode: bypass`, use component-level `adaptations.adaptation.mode` / `adaptations.protection.mode`, or override the adaptation search space with `adaptations.adaptation.candidate_set`. `decision.algorithm.type=session_aware|elo|rl_driven|gmtrouter|bandit|personalization` is no longer a supported public algorithm.
 - `global.router.learning.state_store` optionally mirrors protection snapshots to Redis with bounded request-time reads and fail-open local fallback for multi-replica deployments.
-- `global.services.router_replay.enabled` is the router-wide replay default; when it is on, decisions inherit replay capture unless a route-local `router_replay` plugin sets `enabled: false`
+- router replay is disabled by default; `global.services.router_replay.enabled` is the router-wide replay switch, and when it is on decisions inherit replay capture unless a route-local `router_replay` plugin sets `enabled: false`
 - embedding fallback tuning such as `global.model_catalog.embeddings.semantic.embedding_config.top_k` lives under the router-owned model catalog, not under individual signal rules
 - prototype-aware exemplar compression and label scoring live alongside their owning signal families: `global.model_catalog.embeddings.semantic.embedding_config.prototype_scoring`, `global.model_catalog.modules.classifier.preference.prototype_scoring`, `global.model_catalog.kbs[].prototype_scoring`, and `global.model_catalog.modules.complexity.prototype_scoring`
 - reusable startup-loaded knowledge bases live under `global.model_catalog.kbs[]`, while `routing.signals.kb[]` binds label/group matches into normal routing signals
@@ -78,7 +85,10 @@ Each supported algorithm now has its own tutorial page under `website/docs/tutor
 
 - one directory per plugin or bundle, such as `response-cache/`, `context-compression/`, `rag/`, `memory/`, or `content-safety/`
 - `context-compression/` protects RAG-injected tool results by default; set `targets.rag.mode: extractive` only for routes that accept extractive RAG compression
-- route-local tool policy examples live under `tools/`
+- route-local tool policy examples live under `tools/`; with `mode: none`,
+  `strip_tool_history`
+  removes prior tool/function calls and results from the provider-bound body
+  after routing signals have evaluated the original conversation
 - one fragment example per directory in the current catalog
 
 Each supported plugin now has its own tutorial page under `website/docs/tutorials/plugin/`.

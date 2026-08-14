@@ -86,5 +86,10 @@ describe('MCP dialog accessibility contracts', () => {
     expect(panelSource).not.toMatch(/\b(?:window\.)?confirm\s*\(/)
     expect(panelSource).not.toContain('console.error')
     expect(panelSource).toContain('createLatestMCPRequestRunner')
+    expect(panelSource).toContain(
+      'authLoading || readonlyLoading || serverReadonly || !canManageServers',
+    )
+    expect(panelSource).not.toContain('runtimeConfigWritable')
+    expect(panelSource).toContain('server-wide read-only policy disables MCP server changes')
   })
 })

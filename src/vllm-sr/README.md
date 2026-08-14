@@ -73,7 +73,7 @@ vllm-sr eval --prompt "Explain inflation vs recession in plain English." --json
 # Evaluate one entrypoint's isolated recipe without calling its backend model
 # The response identifies the selected recipe, decision, algorithm, and plugins.
 vllm-sr eval \
-  --model vllm-sr/mom-balanced-v1 \
+  --model vllm-sr/chorus-v1 \
   --prompt "Summarize this architecture plan." \
   --json
 
@@ -152,29 +152,48 @@ To run parallel local stacks from the same machine or multiple worktrees, set `V
 
 ```bash
 # Validate a hand-authored canonical config before serving
-vllm-sr validate config.yaml
+vllm-sr validate --config config.yaml
 ```
 
 `vllm-sr init` was removed in v0.3. Author `config.yaml` directly using the canonical `version/listeners/providers/routing/global` layout, migrate an older file with `vllm-sr config migrate --config old-config.yaml`, or import supported OpenClaw model providers with `vllm-sr config import --from openclaw`. Router-wide defaults come from the router itself and can be overridden under `global:`.
 
-### Inspect configured models
+### Discover built-in and configured models
 
-Use `vllm-sr model list` to print the provider models and routing model cards from your active config without opening the dashboard.
+Use `vllm-sr model list` to discover the compatible virtual models bundled with
+the installed CLI. If the current directory also contains `config.yaml`, the
+command merges its configured provider models and routing model cards into the
+result with an explicit source/kind. With no local config, the command remains
+fully offline and lists the built-in catalog.
 
 ```bash
-# Uses config.yaml in the current directory
+# Latest compatible built-ins, plus ./config.yaml when it exists
 vllm-sr model list
 
-# Inspect a specific config file
+# Include immutable release snapshots or incompatible entries with reasons
+vllm-sr model list --all-versions
+vllm-sr model list --all
+
+# Keep the legacy configured-only view for an explicit file
 vllm-sr model list --config my-config.yaml
+
+# Inspect, materialize, and verify the default built-in virtual model
+vllm-sr model show vllm-sr/chorus-v1
+vllm-sr model fork vllm-sr/chorus-v1 chorus-v1.yaml
+vllm-sr model validate chorus-v1.yaml
 ```
 
-The output is split into two sections:
+For configured YAML, the output is split into two sections:
 
 - **Provider models**: configured model names, the default model marker, provider model IDs, reasoning family, API format, and backend identity fields such as provider, redacted base URL, protocol, and weight.
 - **Model cards**: routing metadata such as modality, parameter size, context window, capabilities, tags, and LoRA names.
 
 Credential fields are intentionally not printed. API keys, API key environment variable names, embedded URL credentials, and sensitive query parameters are omitted or redacted so the command is safe to use in support logs.
+
+The built-in catalog reports each virtual model's traits, required backend
+roles, minimum pool sizes, and recommended candidates. Recommendations are
+starting points, not mandatory model IDs. Forking or editing a verified asset
+is supported, but the resulting user-owned YAML is reported as
+`custom/unverified`.
 
 ### Inspect ingested vector stores
 
@@ -453,7 +472,13 @@ routing:
             action: "header"
 ```
 
-Router replay records are exposed through:
+Router replay records are exposed only through the Router management API
+(port `8080` by default). The public inference listener rejects the reserved
+`/v1/router_replay*` prefix. Set `VSR_MGMT_TOKEN` when management bearer auth
+is enabled; callers need `replay.read`.
+Raw captured bodies and tool payloads additionally require `replay.detail`.
+
+Management endpoints:
 
 - `GET /v1/router_replay?limit=20&offset=0&search=req-123&decision=foo&model=bar&cache_status=cached` - List recent records with pagination metadata. Default page size is `20`; larger `limit` values are capped at `100`. List rows return summary records (routing metadata without large captured bodies or full tool traces). Fetch `GET /v1/router_replay/{id}` for full payloads. Pass `showDetails=true` only when you explicitly need full bodies embedded in each list row.
 - `GET /v1/router_replay/aggregate?search=req-123&decision=foo&model=bar&cache_status=cached` - Return summary and chart aggregates for the filtered replay set.

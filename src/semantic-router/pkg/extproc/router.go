@@ -2,6 +2,7 @@ package extproc
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -88,10 +89,45 @@ func (r *OpenAIRouter) Close() error {
 	if r.lookupTableCancel != nil {
 		r.lookupTableCancel()
 	}
-	if r.CompressionRecovery != nil {
-		return r.CompressionRecovery.Close()
+	r.routerLearningMu.Lock()
+	learningRuntime := r.routerLearningRuntime
+	r.routerLearningMu.Unlock()
+	if learningRuntime != nil {
+		learningRuntime.RetireAndWait()
 	}
-	return nil
+	var closeErrors []error
+	if r.CompressionRecovery != nil {
+		closeErrors = append(closeErrors, r.CompressionRecovery.Close())
+	}
+	closeErrors = append(closeErrors, r.closeReplayRecorders())
+	return errors.Join(closeErrors...)
+}
+
+func (r *OpenAIRouter) closeReplayRecorders() error {
+	if r.ReplayStoreShared {
+		if r.ReplayRecorder == nil {
+			return nil
+		}
+		return r.ReplayRecorder.Close()
+	}
+	seen := make(map[*routerreplay.Recorder]struct{}, len(r.ReplayRecorders)+1)
+	var closeErrors []error
+	for _, recorder := range r.ReplayRecorders {
+		if recorder == nil {
+			continue
+		}
+		if _, duplicate := seen[recorder]; duplicate {
+			continue
+		}
+		seen[recorder] = struct{}{}
+		closeErrors = append(closeErrors, recorder.Close())
+	}
+	if r.ReplayRecorder != nil {
+		if _, duplicate := seen[r.ReplayRecorder]; !duplicate {
+			closeErrors = append(closeErrors, r.ReplayRecorder.Close())
+		}
+	}
+	return errors.Join(closeErrors...)
 }
 
 // Ensure OpenAIRouter implements the ext_proc calls.

@@ -28,6 +28,33 @@ func NewMCPHandler(manager *mcp.Manager, readonlyMode bool) *MCPHandler {
 	}
 }
 
+func prepareMCPServerConfig(w http.ResponseWriter, config *mcp.ServerConfig) bool {
+	if config.ID == "" {
+		config.ID = uuid.New().String()
+	}
+	if config.Name == "" {
+		http.Error(w, "Name is required", http.StatusBadRequest)
+		return false
+	}
+	if config.Transport == "" {
+		http.Error(w, "Transport is required", http.StatusBadRequest)
+		return false
+	}
+	if config.Transport != mcp.TransportStdio && config.Transport != mcp.TransportStreamableHTTP {
+		http.Error(w, "Invalid transport type. Must be 'stdio' or 'streamable-http'", http.StatusBadRequest)
+		return false
+	}
+	if config.Transport == mcp.TransportStdio && config.Connection.Command == "" {
+		http.Error(w, "Command is required for stdio transport", http.StatusBadRequest)
+		return false
+	}
+	if config.Transport == mcp.TransportStreamableHTTP && config.Connection.URL == "" {
+		http.Error(w, "URL is required for streamable-http transport", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 // ========== Server Config Handlers ==========
 
 // ListServersHandler GET /api/mcp/servers - Get all server configurations
@@ -74,40 +101,8 @@ func (h *MCPHandler) CreateServerHandler() http.HandlerFunc {
 			return
 		}
 
-		// Generate ID
-		if config.ID == "" {
-			config.ID = uuid.New().String()
-		}
-
-		// Validate required fields
-		if config.Name == "" {
-			http.Error(w, "Name is required", http.StatusBadRequest)
+		if !prepareMCPServerConfig(w, &config) {
 			return
-		}
-
-		if config.Transport == "" {
-			http.Error(w, "Transport is required", http.StatusBadRequest)
-			return
-		}
-
-		// Validate transport type
-		if config.Transport != mcp.TransportStdio && config.Transport != mcp.TransportStreamableHTTP {
-			http.Error(w, "Invalid transport type. Must be 'stdio' or 'streamable-http'", http.StatusBadRequest)
-			return
-		}
-
-		// Validate connection configuration
-		switch config.Transport {
-		case mcp.TransportStdio:
-			if config.Connection.Command == "" {
-				http.Error(w, "Command is required for stdio transport", http.StatusBadRequest)
-				return
-			}
-		case mcp.TransportStreamableHTTP:
-			if config.Connection.URL == "" {
-				http.Error(w, "URL is required for streamable-http transport", http.StatusBadRequest)
-				return
-			}
 		}
 
 		if err := h.manager.AddServer(&config); err != nil {
@@ -209,6 +204,10 @@ func (h *MCPHandler) ConnectServerHandler() http.HandlerFunc {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if h.readonlyMode {
+			http.Error(w, "Operation not allowed in readonly mode", http.StatusForbidden)
+			return
+		}
 
 		// Extract ID from URL
 		path := strings.TrimPrefix(r.URL.Path, "/api/mcp/servers/")
@@ -243,6 +242,10 @@ func (h *MCPHandler) DisconnectServerHandler() http.HandlerFunc {
 
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.readonlyMode {
+			http.Error(w, "Operation not allowed in readonly mode", http.StatusForbidden)
 			return
 		}
 
@@ -305,6 +308,10 @@ func (h *MCPHandler) TestConnectionHandler() http.HandlerFunc {
 
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.readonlyMode {
+			http.Error(w, "Operation not allowed in readonly mode", http.StatusForbidden)
 			return
 		}
 

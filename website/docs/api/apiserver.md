@@ -9,10 +9,12 @@ Use this page when you want to:
 - Call classification helpers (intent, PII, jailbreak, eval) without sending a chat completion
 - Inspect loaded models and OpenAI-compatible model IDs
 - Read or update router config / recipes
+- Inspect Router Replay records, aggregates, and session trajectories
 - Submit Router Learning outcomes linked to a replay record
 
-For client-facing chat traffic (`POST /v1/chat/completions`) and Router Replay
-list APIs, see [Router API](./router).
+For client-facing chat traffic (`POST /v1/chat/completions`), see
+[Router API](./router). Router Replay is intentionally management-only even
+though its paths retain the `/v1/router_replay` compatibility prefix.
 
 :::tip Live schema
 Always prefer the running server as the source of truth for field-level details:
@@ -31,7 +33,16 @@ http://localhost:8080
 ```
 
 With local `vllm-sr serve`, the apiserver is usually reachable at
-`http://localhost:8080`.
+`http://localhost:8080`. The local container flow publishes this management
+port on `127.0.0.1` only; it is not exposed on every host interface. To manage a
+router running on a remote machine, create an SSH tunnel from your workstation:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 <router-host>
+```
+
+Then use `http://localhost:8080` locally. This restriction applies to the
+Router apiserver port, not to configured client-facing Envoy listener ports.
 Category names, model IDs, and decisions in the sample responses below depend on
 your recipe and will differ per deployment.
 
@@ -151,6 +162,10 @@ Example response (fields vary by recipe):
 | `GET` | `/api/v1/embeddings/models` | Loaded embedding models |
 | `GET` | `/v1/models` | OpenAI-compatible model listing |
 | `GET` | `/metrics/classification` | Classification metrics |
+| `GET` | `/v1/router_replay` | List Router Replay records (`replay.read`) |
+| `GET` | `/v1/router_replay/{id}` | Read one Router Replay record (`replay.read`) |
+| `GET` | `/v1/router_replay/aggregate` | Aggregate replay routing and cost metadata (`replay.read`) |
+| `GET` | `/v1/router_replay/trajectory` | Build a replay session trajectory (`replay.read`) |
 | `POST` | `/v1/router/outcomes` | Submit Router Learning outcome linked to a replay id |
 
 ### Router config and recipes
@@ -421,6 +436,9 @@ Example response (abbreviated):
     }
   },
   "recommended_models": ["base-model"],
+  "selected_model": "base-model",
+  "selection_status": "selected",
+  "selection_method": "static",
   "routing_decision": "default/general",
   "metrics": {},
   "signal_confidences": {
@@ -429,6 +447,13 @@ Example response (abbreviated):
   "signal_errors": {}
 }
 ```
+
+`selected_model` is present only when Eval can run the same selector or resolve
+the configured final-output model without executing generation. Dynamic
+algorithms that require a real request return `selection_status` as
+`execution_required` instead of fabricating a final model from the first
+recommended candidate. `recommended_models` remains the candidate set, not the
+selected backend.
 
 ### Embeddings and similarity
 

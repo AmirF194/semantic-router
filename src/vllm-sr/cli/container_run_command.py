@@ -7,6 +7,7 @@ from cli.container_images import _normalize_platform
 from cli.utils import get_logger
 
 log = get_logger(__name__)
+ORDINARY_PORT_MAPPING_LENGTH = 2
 
 
 def build_base_run_command(
@@ -90,9 +91,21 @@ def append_mount_specs(cmd, mount_specs: list[str]):
         cmd.extend(["-v", mount_spec])
 
 
-def append_port_mappings(cmd, port_mappings: list[tuple[int, int]]):
-    for host_port, container_port in port_mappings:
-        cmd.extend(["-p", f"{host_port}:{container_port}"])
+def append_port_mappings(
+    cmd,
+    port_mappings: list[tuple[int, int] | tuple[str, int, int]],
+):
+    """Append ordinary or explicitly host-bound published ports."""
+    for mapping in port_mappings:
+        if len(mapping) == ORDINARY_PORT_MAPPING_LENGTH:
+            host_port, container_port = mapping
+            rendered = f"{host_port}:{container_port}"
+        else:
+            host_address, host_port, container_port = mapping
+            if ":" in host_address and not host_address.startswith("["):
+                host_address = f"[{host_address}]"
+            rendered = f"{host_address}:{host_port}:{container_port}"
+        cmd.extend(["-p", rendered])
 
 
 def append_env_vars(

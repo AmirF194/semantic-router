@@ -51,6 +51,8 @@ VARIANT_FIELDS = frozenset(
     {
         "id",
         "query",
+        "display_prompt",
+        "playground",
         "messages",
         "tools",
         "repeat",
@@ -61,6 +63,7 @@ VARIANT_FIELDS = frozenset(
     }
 )
 PADDING_FIELDS = frozenset({"text", "repeat", "placement"})
+PLAYGROUND_FIELDS = frozenset({"enabled", "reason"})
 ROBUSTNESS_FIELDS = frozenset({"min_pass_rate"})
 
 
@@ -69,6 +72,12 @@ class ProbePadding:
     text: str
     repeat: int
     placement: str
+
+
+@dataclass(frozen=True)
+class ProbePlaygroundPolicy:
+    enabled: bool
+    reason: str | None = None
 
 
 @dataclass
@@ -87,6 +96,8 @@ class Probe:
     forbidden_signals: tuple[tuple[str, str], ...] = ()
     signal_match: str = "contains"
     query: str | None = None
+    display_prompt: str | None = None
+    playground: ProbePlaygroundPolicy = ProbePlaygroundPolicy(enabled=True)
     repeat: int = 1
     padding: ProbePadding | None = None
     messages: tuple[dict[str, Any], ...] = ()
@@ -227,6 +238,14 @@ def _load_variant(
             f"{label} must include a non-empty id and exactly one of query or messages"
         )
     probe_id = f"{defaults.decision_id}:{variant_id}"
+    display_prompt = _optional_string(raw_variant.get("display_prompt"))
+    playground = _normalize_playground_policy(
+        raw_variant.get("playground"), defaults.decision_id, variant_id
+    )
+    if not playground.enabled and display_prompt is None:
+        raise ValueError(
+            f"{probe_id} display_prompt is required when Playground is disabled"
+        )
     return Probe(
         decision_id=defaults.decision_id,
         variant_id=variant_id,
@@ -246,6 +265,8 @@ def _load_variant(
         forbidden_signals=defaults.forbidden_signals,
         signal_match=defaults.signal_match,
         query=query or None,
+        display_prompt=display_prompt,
+        playground=playground,
         repeat=_normalize_repeat(
             raw_variant.get("repeat"), defaults.decision_id, variant_id
         ),
@@ -279,6 +300,24 @@ def _normalize_tags(raw_tags: Any) -> tuple[str, ...]:
     if len(normalized) != len(set(normalized)):
         raise ValueError("tags must not contain duplicates")
     return tuple(normalized)
+
+
+def _normalize_playground_policy(
+    raw_policy: Any, decision_id: str, variant_id: str
+) -> ProbePlaygroundPolicy:
+    if raw_policy is None:
+        return ProbePlaygroundPolicy(enabled=True)
+    label = f"{decision_id}:{variant_id} playground"
+    if not isinstance(raw_policy, dict):
+        raise TypeError(f"{label} must be a mapping")
+    reject_unknown_fields(raw_policy, PLAYGROUND_FIELDS, label)
+    enabled = raw_policy.get("enabled")
+    if not isinstance(enabled, bool):
+        raise TypeError(f"{label}.enabled must be a boolean")
+    reason = _optional_string(raw_policy.get("reason"))
+    if not enabled and reason is None:
+        raise ValueError(f"{label}.reason is required when disabled")
+    return ProbePlaygroundPolicy(enabled=enabled, reason=reason)
 
 
 def _normalize_match_mode(raw_mode: Any, label: str) -> str:

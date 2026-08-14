@@ -8,7 +8,9 @@ from cli.commands import runtime_paths
 from cli.commands.runtime_paths import (
     _container_runtime_config_path,
     _runtime_config_output_path,
+    _runtime_config_provenance_path,
     _write_runtime_config,
+    materialize_runtime_config,
 )
 from cli.runtime_stack import normalize_stack_name
 
@@ -189,3 +191,78 @@ def test_replace_failure_preserves_target_and_removes_temporary_file(
 
     assert runtime_path.read_text(encoding="utf-8") == "version: old\n"
     assert list(runtime_path.parent.glob(f".{runtime_path.name}.*.tmp")) == []
+
+
+def test_materialize_runtime_config_creates_active_and_provenance_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "config.yaml"
+    source.write_text("version: source\n", encoding="utf-8")
+    effective = b"version: effective\n"
+    replacements: list[tuple[Path, Path]] = []
+    real_replace = os.replace
+
+    def record_replace(source_path, target_path):
+        replacements.append((Path(source_path), Path(target_path)))
+        real_replace(source_path, target_path)
+
+    monkeypatch.setattr(runtime_paths.os, "replace", record_replace)
+
+    active = materialize_runtime_config(source, effective)
+    provenance = _runtime_config_provenance_path(active)
+
+    assert active == tmp_path / ".vllm-sr" / "runtime-config.yaml"
+    assert active.read_bytes() == effective
+    assert provenance.is_file()
+    assert [target for _, target in replacements] == [active, provenance]
+    assert all(
+        source_path.parent == target.parent for source_path, target in replacements
+    )
+    assert not list(active.parent.glob(".*.tmp"))
+
+
+def test_materialize_refreshes_unchanged_active_when_source_changes(tmp_path: Path):
+    source = tmp_path / "config.yaml"
+    source.write_text("version: first\n", encoding="utf-8")
+    active = materialize_runtime_config(source, b"version: first-effective\n")
+
+    source.write_text("version: second\n", encoding="utf-8")
+    refreshed = materialize_runtime_config(source, b"version: second-effective\n")
+
+    assert refreshed == active
+    assert active.read_bytes() == b"version: second-effective\n"
+
+
+def test_materialize_preserves_dashboard_change_when_source_changes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    source = tmp_path / "config.yaml"
+    source.write_text("version: first\n", encoding="utf-8")
+    active = materialize_runtime_config(source, b"version: first-effective\n")
+    active.write_text("version: dashboard-edit\n", encoding="utf-8")
+    source.write_text("version: second\n", encoding="utf-8")
+
+    preserved = materialize_runtime_config(source, b"version: second-effective\n")
+
+    assert preserved == active
+    assert active.read_text(encoding="utf-8") == "version: dashboard-edit\n"
+    assert "Preserving Dashboard or package changes" in caplog.text
+
+
+def test_materialize_uses_custom_host_state_without_container_path_leak(
+    tmp_path: Path,
+):
+    source = tmp_path / "source" / "config.yaml"
+    source.parent.mkdir()
+    source.write_text("version: v0.3\n", encoding="utf-8")
+    state_root = tmp_path / "host-state"
+
+    active = materialize_runtime_config(
+        source,
+        source.read_bytes(),
+        state_root_dir=state_root,
+        stack_name="audit-a",
+    )
+
+    assert active == state_root / ".vllm-sr" / "runtime-config.audit-a.yaml"
+    assert not (source.parent / ".vllm-sr").exists()

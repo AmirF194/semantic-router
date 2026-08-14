@@ -102,7 +102,7 @@ Matched signal headers contain comma-separated rule names. They are demoted to t
 | ------ | ----------- |
 | `x-vsr-matched-projections` | Comma-separated projection mapping outputs that matched the request. |
 
-Projection scores and full projection traces are stored in router replay records rather than expanded into response headers. Use `x-vsr-replay-id` to inspect those details in the dashboard or replay APIs.
+Projection scores and full projection traces are stored in router replay records rather than expanded into response headers. Use `x-vsr-replay-id` to inspect those details in the Dashboard or through the authenticated Router management API; public inference listeners do not serve replay records.
 
 ## Cache And Plugin Headers
 

@@ -26,3 +26,23 @@ def test_wait_for_router_health_fails_fast_when_router_exits(monkeypatch):
 
     assert calls["exec"] == 0
     assert calls["logs"] == 1
+
+
+def test_wait_for_router_health_uses_configured_management_port(monkeypatch):
+    commands = []
+    monkeypatch.setattr(
+        runtime_lifecycle, "_emit_router_startup_logs", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(runtime_lifecycle, "container_status", lambda _name: "running")
+
+    def fake_exec(_container, command):
+        commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(runtime_lifecycle, "container_exec", fake_exec)
+
+    runtime_lifecycle.wait_for_router_health(
+        resolve_runtime_stack(), management_port=9090
+    )
+
+    assert commands == [["curl", "-f", "-s", "http://localhost:9090/ready"]]

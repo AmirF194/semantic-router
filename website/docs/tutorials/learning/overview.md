@@ -151,6 +151,9 @@ vllm-sr eval recipe-learning \
   --output-dir ./router-learning-report
 ```
 
+`--endpoint` targets the Router management API, never the public inference
+listener. Export `VSR_MGMT_TOKEN` first when management bearer auth is enabled.
+
 For air-gapped or CI workflows, export replay JSON first and pass it with
 `--replay-file`. Add `--cases-file` when eval cases include expected decisions
 or models.

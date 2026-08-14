@@ -153,8 +153,8 @@ interop pattern that motivates this gate lives in
 global:
   services:
     router_replay:
-      store_backend: postgres     # default; SQL-queryable audit storage
       enabled: true
+      store_backend: postgres     # explicit durable, SQL-queryable audit storage
       async_writes: true
       postgres:
         host: postgres
@@ -164,13 +164,17 @@ global:
         password: router-secret
 ```
 
-`global.services.router_replay.enabled` is the router-wide default. When it is on, a decision captures replay unless that decision adds a route-local `router_replay` plugin with `enabled: false`.
+Router replay is disabled by default. Set `global.services.router_replay.enabled`
+to enable it router-wide; when it is on, a decision captures replay unless that
+decision adds a route-local `router_replay` plugin with `enabled: false`. A
+decision may also opt in explicitly. If no durable backend is configured, the
+default in-memory store is process-local and is lost on restart.
 
 The `store_backend` field controls where routing-decision replay records are persisted. Available backends:
 
 | Backend | Durability | Use case |
 |---------|-----------|----------|
-| `postgres` | Full SQL queryability, long-term audit retention | Production (default) |
+| `postgres` | Full SQL queryability, long-term audit retention | Production audit storage |
 | `redis` | Survives router restart, shared across replicas | Lightweight deployments already running Redis |
 | `milvus` | Vector-searchable replay records | Semantic replay search |
 | `memory` | Lost on router restart | Local development only |

@@ -197,7 +197,10 @@ func buildRouterComponents(cfg *config.RouterConfig) (*routerComponents, error) 
 	}
 
 	responseAPIFilter := createResponseAPIFilter(cfg)
-	replayRecorders, replayRecorder, replayStoreShared := createReplayRuntime(cfg)
+	replayRecorders, replayRecorder, replayStoreShared, err := createReplayRuntime(cfg)
+	if err != nil {
+		return nil, err
+	}
 	var replayReaderForLookup store.Reader
 	if replayRecorder != nil {
 		replayReaderForLookup = replayRecorder.Reader()
@@ -242,7 +245,7 @@ func buildRouterComponents(cfg *config.RouterConfig) (*routerComponents, error) 
 }
 
 func (components *routerComponents) buildRouter() *OpenAIRouter {
-	return &OpenAIRouter{
+	router := &OpenAIRouter{
 		Config:                components.cfg,
 		CategoryDescriptions:  components.categoryDescriptions,
 		Classifier:            components.classifier,
@@ -263,4 +266,8 @@ func (components *routerComponents) buildRouter() *OpenAIRouter {
 		RateLimiter:           components.rateLimiter,
 		lookupTableCancel:     components.lookupTableCancel,
 	}
+	if components.classificationSvc != nil {
+		components.classificationSvc.SetEvalModelSelector(router)
+	}
+	return router
 }

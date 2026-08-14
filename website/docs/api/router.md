@@ -30,10 +30,7 @@ outcomes), see [Router Apiserver API](./apiserver).
 | OpenAI Responses API delete | `DELETE /v1/responses/{id}` | Supported | Requires Response API service/store |
 | OpenAI Responses API input items | `GET /v1/responses/{id}/input_items` | Supported | Requires Response API service/store |
 | OpenAI Models API | `GET /v1/models` | Supported on apiserver | Served by `:8080`; can be re-exposed through Envoy |
-| Router Replay list | `GET /v1/router_replay` | Supported when enabled | Served via ExtProc / Envoy path |
-| Router Replay detail | `GET /v1/router_replay/{id}` | Supported when enabled | Full record including bodies when captured |
-| Router Replay aggregate | `GET /v1/router_replay/aggregate` | Supported when enabled | Cost / decision / token summaries |
-| Router Replay trajectory | `GET /v1/router_replay/trajectory` | Supported when enabled | Session message timeline |
+| Router Replay paths | `GET /v1/router_replay*` | Management API only | Public Envoy ingress fails closed with `404`; use authenticated port `8080` |
 
 ## Quick start: chat completions
 
@@ -87,8 +84,8 @@ Tips:
 
 - Explicit model names still work when you want to pin a backend.
 - With Router Replay enabled, look for replay correlation headers such as
-  `x-vsr-replay-id` (exact header set depends on config) and then query
-  `GET /v1/router_replay/{id}`.
+  `x-vsr-replay-id` (exact header set depends on config) and then query the
+  management API at `http://localhost:8080/v1/router_replay/{id}`.
 
 ## OpenAI Responses API
 
@@ -147,16 +144,23 @@ global:
       store_backend: postgres   # or memory for local development
 ```
 
-`global.services.router_replay.enabled` is the router-wide default. A decision can
-opt out with a route-local `router_replay` plugin set to `enabled: false`.
+Replay is disabled by default. `global.services.router_replay.enabled` is the
+router-wide switch. A decision can opt in explicitly or opt out from a globally
+enabled service with a route-local `router_replay` plugin.
 
-Replay HTTP APIs are served on the **Envoy / ExtProc** path (typically
-`http://localhost:8801`), not on apiserver `:8080`.
+Replay HTTP APIs are served only on the **Router management API** (typically
+`http://localhost:8080`). The public Envoy inference listener reserves and
+rejects every `/v1/router_replay*` path with `404`, including requests carrying
+`x-vsr-skip-processing`. When management bearer auth is enabled, callers need
+the `replay.read` permission; only principals with `replay.detail` receive raw
+prompt, response, and tool payloads. The built-in viewer role is read-only and
+redacted, while operator and admin retain detail access.
 
 ### List recent records
 
 ```bash
-curl -sS 'http://localhost:8801/v1/router_replay?limit=20'
+curl -sS 'http://localhost:8080/v1/router_replay?limit=20' \
+  -H "Authorization: Bearer ${VSR_MGMT_TOKEN}"
 ```
 
 Useful query parameters:
@@ -192,6 +196,9 @@ Example list response (summary rows omit large bodies by default):
       "decision": "code",
       "selected_model": "qwen-coder",
       "original_model": "auto",
+      "lifecycle_state": "completed",
+      "ended_at": "2026-08-04T12:00:01Z",
+      "duration_ms": 842,
       "from_cache": false,
       "streaming": false,
       "prompt_tokens": 24,
@@ -202,10 +209,20 @@ Example list response (summary rows omit large bodies by default):
 }
 ```
 
+Replay lifecycle is authoritative: `in_progress` means response headers or
+partial streaming data may already exist but no terminal frame has been
+observed; `completed` means the response finished; `failed` means routing or an
+upstream response failed; and `aborted` means the stream ended without a valid
+terminal frame (for example, a client disconnect or timeout). An HTTP status of
+200 by itself is not completion. Cost aggregates include only `completed`
+records, while lifecycle counts surface failed, aborted, and still-running
+requests separately.
+
 ### Fetch one full record
 
 ```bash
-curl -sS http://localhost:8801/v1/router_replay/replay_7f3a91
+curl -sS http://localhost:8080/v1/router_replay/replay_7f3a91 \
+  -H "Authorization: Bearer ${VSR_MGMT_TOKEN}"
 ```
 
 Returns the full routing record, including captured request/response bodies when
@@ -214,7 +231,8 @@ those were stored.
 ### Aggregates for Insights-style dashboards
 
 ```bash
-curl -sS 'http://localhost:8801/v1/router_replay/aggregate?decision=code'
+curl -sS 'http://localhost:8080/v1/router_replay/aggregate?decision=code' \
+  -H "Authorization: Bearer ${VSR_MGMT_TOKEN}"
 ```
 
 Example response (abbreviated):
@@ -242,7 +260,8 @@ Example response (abbreviated):
 ### Session trajectory
 
 ```bash
-curl -sS 'http://localhost:8801/v1/router_replay/trajectory?session_id=sess_alice_42'
+curl -sS 'http://localhost:8080/v1/router_replay/trajectory?session_id=sess_alice_42' \
+  -H "Authorization: Bearer ${VSR_MGMT_TOKEN}"
 ```
 
 Returns an ordered message timeline reconstructed from replay records for that

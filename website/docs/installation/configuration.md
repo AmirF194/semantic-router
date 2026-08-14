@@ -49,6 +49,10 @@ The detailed background is in [Unified Config Contract v0.3](../proposals/unifie
   - `defaults`
   - `models`
   - `providers.defaults` holds `default_model`, `reasoning_families`, and `default_reasoning_effort`
+  - reasoning-family `type` supports `chat_template_kwargs`, dialect-aware
+    `reasoning_effort`, and `top_level_reasoning_effort`; use the top-level form
+    only for a local provider that requires the canonical `reasoning_effort`
+    request field and rejects `chat_template_kwargs`
   - `providers.models[*]` holds `provider_model_id`, `backend_refs`, `pricing`, `api_format`, and `external_model_ids`
   - `providers.models[*].pricing` uses per-million-token rates for prompt, cached input, optional cache writes, and completion; `cache_write_per_1m` defaults to `prompt_per_1m` when omitted
 - `global` owns router-wide runtime overrides.
@@ -57,7 +61,7 @@ The detailed background is in [Unified Config Contract v0.3](../proposals/unifie
   - `global.router.auto_model_names` declares the request model aliases that enter full automatic routing. Defaults include `vllm-sr/auto`, `auto`, and `MoM`; `auto_model_name` remains the legacy single-name compatibility field.
   - `global.router.learning.adaptation` enables online model-choice learning after the base decision algorithm. `global.router.learning.protection` protects agentic continuity, cache, tool loops, and handoff cost. `decision.algorithm.type=session_aware|elo|rl_driven|gmtrouter|bandit|personalization` is removed; decisions can use normal base algorithms or omit `algorithm`. Per-decision `adaptations` is strictly validated and should be used only for `mode: apply|observe|bypass`, component modes, optional `adaptation.candidate_set`, and sparse `protection.stability_weight` / `protection.switch_margin` overrides.
   - `global.services` groups shared APIs and control-plane services such as `response_api`, `router_replay`, `observability`, `authz`, and `ratelimit`
-  - `global.services.router_replay.enabled` acts as the default replay switch for every decision; route-local `router_replay.enabled: false` is the explicit opt-out
+  - router replay is disabled by default; `global.services.router_replay.enabled` acts as the router-wide replay switch, while route-local plugins can explicitly opt in or opt out
   - `global.stores` groups shared storage-backed services such as `semantic_cache`, `memory`, and `vector_store`
 - `global.integrations` groups helper runtime integrations such as `tools` and `looper`
 - `global.integrations.looper.fusion` defines direct Fusion model slugs. The built-in default is `vllm-sr/fusion`; add aliases such as `openrouter/fusion` explicitly only when you want them. Judge and panel settings stay per-decision under `routing.decisions[].algorithm.fusion`.
@@ -72,11 +76,13 @@ The detailed background is in [Unified Config Contract v0.3](../proposals/unifie
 - `routing.signals.metadata` matches bounded, untrusted caller hints; authenticated identity remains under `authz`
 - `routing.signals.classifiers` exposes generic native or constrained-LLM label scores to decision predicates
 - `decision.algorithm.type: prompt` selects one declared `modelRef` with a concrete helper model and runtime-owned JSON output contract
+- `decision.algorithm.type: confidence` uses a closed method/order/filter/error-policy vocabulary and normalized nonzero thresholds in `(0, 1]`. Because its scalar numeric fields are not pointers, `0` is the canonical unset sentinel and activates the runtime default; `automix_entailment` additionally requires an absolute HTTP(S) verifier URL.
 - `global.model_catalog.modules.prompt_compression.profile` provides built-in signal-compression scoring defaults for `default`, `coding`, `medical`, `security`, and `multi_turn` workloads. The `multi-turn` alias is normalized to `multi_turn`, unknown profile names fail config validation, and explicit weights/preserve counts override the selected profile.
 - `global.model_catalog.modules.hallucination_mitigation.detector.backend` selects the hallucination span detector backend. It defaults to `candle` (the in-process token classifier); set it to `endpoint` to call a generative span detector behind an OpenAI-compatible server, which then requires an absolute `http(s)` `detector.endpoint` plus a `detector.model_id`. Config validation rejects any other value.
 - `providers.models[].reliability` controls generated Envoy least-request or round-robin balancing, bounded connect/reset retries, circuit breakers, and passive 5xx outlier ejection.
 - `response_cache` supports `semantic`, `exact`, and `exact_then_semantic` modes with route-authorized request bypass controls.
 - `context_compression` performs provider-aware route-local compression on the working body, preserves JSON/multimodal structure, and uses `targets.rag.mode: extractive` for explicit RAG evidence compression.
+- `tools.configuration.strip_tool_history` is valid with `mode: none` and removes prior tool/function calls and results only from the provider-bound body after routing has evaluated the original conversation.
 
 ## Canonical example
 
@@ -96,6 +102,9 @@ providers:
       qwen3:
         type: chat_template_kwargs
         parameter: enable_thinking
+      mistral:
+        type: top_level_reasoning_effort
+        parameter: reasoning_effort
     default_reasoning_effort: medium
   models:
     - name: qwen3-8b
@@ -346,6 +355,25 @@ Use the canonical YAML directly.
 vllm-sr serve --config config.yaml
 ```
 
+`serve --config` keeps the same interface, but local source ownership is now
+explicit. The source file is mounted read-only. The default stack runs from
+`.vllm-sr/runtime-config.yaml`; a named stack runs from
+`.vllm-sr/runtime-config.<normalized-stack>.yaml`. Dashboard edits and Recipe
+activation update that runtime-owned file and survive a restart. If the active
+file no longer matches the CLI's last materialized digest, changing the source
+does not overwrite it: `serve` preserves the active file and warns.
+The local Router still resolves relative knowledge-base, model, tool, and
+plugin assets from the original workspace root; moving the active file under
+`.vllm-sr` does not change those paths.
+
+When a package is active, intentionally switch through the **Packages** panel:
+install a source-equivalent package if needed, review it, and activate it. The
+active package pointer, object digest, and runtime config form one transaction;
+moving only an individual `.vllm-sr` file is not a supported reset. Operators
+recovering damaged low-level state should preserve the entire stack-specific
+state directory and follow the operator recovery procedure rather than
+partially deleting package state.
+
 To migrate an older config first:
 
 ```bash
@@ -451,6 +479,128 @@ recipes:
 It does not emit `listeners`, `providers`, or `global`.
 
 ## Import and migration
+
+### Built-in virtual models
+
+Curated scenarios are distributed as a model catalog inside the `vllm-sr`
+wheel and release images. The public object is a model; each referenced
+exact-five Recipe bundle contains metadata, canonical YAML and DSL, probes, and
+documentation. Its `config.yaml` can contain multiple request-facing
+`entrypoints` and isolated `recipes`:
+
+```bash
+vllm-sr model list
+vllm-sr model show vllm-sr/chorus-v1
+vllm-sr model fork vllm-sr/chorus-v1 chorus-v1.yaml
+vllm-sr model validate chorus-v1.yaml
+```
+
+The default catalog enables `vllm-sr/chorus-v1`. Select more than one compatible
+scenario from the same asset while materializing a user-owned config:
+
+```bash
+vllm-sr model fork vllm-sr/chorus-v1 chorus-custom.yaml \
+  --enable vllm-sr/chorus-v1-vault \
+  --default vllm-sr/chorus-v1
+```
+
+The repository source is `config/built-in/`. `latest/` follows the reviewed
+catalog on `main` and reports `catalog_version: latest` with
+`release: unreleased`. A `vX.Y/` directory is created only while preparing that
+release:
+
+```bash
+make built-in-model-snapshot RELEASE_VERSION=X.Y.Z
+```
+
+The target refuses to overwrite an existing version. The package copy under
+`cli/model_assets/` is generated from the same source and CI rejects byte
+drift. Use `--catalog-version vX.Y` to inspect, fork, or validate against a
+published release snapshot.
+
+Publishing tag `vX.Y.Z` is bound mechanically to snapshot directory
+`config/built-in/vX.Y/`. The release gate requires its `catalog.yaml` to declare
+`channel: release`, `release: vX.Y`, and `catalog_version: vX.Y`; a missing or
+mismatched snapshot stops Docker, Helm, PyPI, crate, and GitHub publication.
+The wheel gate derives the complete catalog and exact-five bundle inventory
+from that validated snapshot, then compares every packaged byte instead of
+maintaining a release-specific filename allowlist. Later pull requests compare
+each already-published snapshot with its reachable stable tag and reject file,
+inventory, or byte changes while still allowing the first addition of an
+unpublished version.
+
+By default, `model list` shows compatible models from `latest`. Add
+`--all-versions` to list installed snapshots and `--all` to retain incompatible
+entries with the reason they were filtered. Catalog compatibility declares the
+supported CLI range, Router config schema, and required features explicitly; it
+is never inferred from an ID. A future `vllm-sr/chorus-v2` is a separate policy
+generation that can coexist with Chorus V1 when both are compatible.
+
+`model show` reports each scenario's traits, required backend roles, minimum
+pool sizes, and recommended candidates. Those recommendations are an
+out-of-box starting point, not mandatory vendor IDs. Users can fork and bind a
+different pool or edit any routing policy. Maintainer `verified` status is bound
+to the exact bundled asset; an override remains valid canonical YAML but is
+reported as `custom/unverified`.
+
+The **Built-in Model Catalog** workflow checks maintained Recipe conformance,
+source-to-package drift, and installed CLI discovery. Its expiring artifact is
+only a validation receipt, never an installable distribution channel. Curated
+catalog YAML is delivered only inside the version-matched wheel and images.
+
+### Custom Recipe package transport
+
+`vllm-sr recipe pack` remains a compatibility transport for a custom five-file
+directory containing `metadata.yaml`, `config.yaml`, `probes.yaml`,
+`recipe.dsl`, and `README.md`:
+
+```bash
+vllm-sr recipe pack path/to/custom-recipe
+```
+
+The JSON result includes the output path, archive SHA-256, and content-addressed
+`recipe_digest`. The ZIP is not a built-in catalog or installed runtime format:
+extract it to recover the five source files, then point `vllm-sr serve --config`
+at `config.yaml`. Trusted custom archives remain supported by the compatibility
+API/CLI transport for teams that already use that workflow.
+
+The Dashboard does not provide an official custom-ZIP import flow. Its
+Mixture-of-Models view lists built-in catalogs packaged with `vllm-sr` and may
+manage custom packages that were already recorded through the compatibility
+API. Review custom package identity, checksum, conformance, and required
+environment bindings before recording or activating one. Activation switches
+the runtime-owned config transactionally; a failed activation or restore leaves
+the prior active Recipe in place.
+
+Packaging preserves raw source bytes and never expands environment references.
+Before sharing a custom archive, remove real API keys, passwords, endpoints with
+embedded credentials, and other secrets. Use `api_key_env` or a pure
+`${ENV_NAME}` reference. Packaging rejects literal credential-like values,
+embedded URL credentials, sensitive query parameters, standard
+credential-carrying headers, YAML indirection/explicit tags, and local-process
+MCP transports; errors identify only the YAML key path and never include the
+rejected value.
+
+Export each required value on the host and authorize its name explicitly when
+serving:
+
+```bash
+export PROVIDER_API_KEY=...  # keep the value outside the Recipe
+vllm-sr serve --config path/to/recipe/config.yaml \
+  --recipe-env PROVIDER_API_KEY
+```
+
+Package activation fails closed when a required name was not authorized at
+startup. The name may be shown for operator review, but the value is never
+included in the package, Dashboard response, runtime config, log, or container
+command argument.
+
+Hot activation also fails before writing when the Recipe would change the
+published listener topology, requires a managed storage service that was not
+provisioned when the stack started, or enables Router management authentication
+without a Dashboard service credential. Restart the stack from a compatible
+Recipe source for those topology changes. Future full-stack reconciliation is
+tracked separately from the safe v1 hot-switch path.
 
 ### Onboarding remote import
 

@@ -56,3 +56,10 @@ Keep these rules in mind:
 - keep `global.router.config_source` at `file` unless Kubernetes CRD reconciliation is intentionally driving runtime config
 - put shared backing services in `global:`
 - keep route-local matching in `routing:`
+
+Provider reasoning syntax is intentionally outside `global:`. Declare it once
+under `providers.defaults.reasoning_families`, then bind a model with
+`providers.models[].reasoning_family`. Use `top_level_reasoning_effort` only
+when a local provider requires the canonical top-level `reasoning_effort` field;
+other supported forms are `chat_template_kwargs` and dialect-aware
+`reasoning_effort`.

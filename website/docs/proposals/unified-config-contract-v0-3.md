@@ -75,6 +75,14 @@ classifier labels. Decision leaves may apply bounded numeric predicates to
 signal values, and prompt-driven model choice remains a route-local algorithm
 over the decision's declared `modelRefs`.
 
+Confidence model cascades are also a closed route-local contract. Methods,
+escalation orders, token filters, and error policies reject unknown values;
+configured nonzero thresholds and cost tradeoffs are normalized to `(0, 1]`;
+and effective hybrid weights must sum to `1`. The current scalar schema cannot
+distinguish omission from an explicit zero, so zero consistently means
+"use the runtime default". External verifier URL and timeout fields are valid
+only for `automix_entailment`, whose URL must be absolute HTTP(S).
+
 It no longer owns endpoints, API keys, listeners, or router-global runtime settings.
 
 ### Deployment binding split
@@ -83,7 +91,11 @@ Model semantics and deployment bindings are now separated explicitly:
 
 - `routing.modelCards` carries semantic catalog data such as size, context window, description, and capabilities
 - `routing.modelCards[].loras` carries the canonical LoRA adapter catalog for each logical model
-- `providers.defaults` carries provider-wide defaults such as `default_model`, `reasoning_families`, and `default_reasoning_effort`
+- `providers.defaults` carries provider-wide defaults such as `default_model`,
+  `reasoning_families`, and `default_reasoning_effort`. Reasoning families
+  declare one of `chat_template_kwargs`, dialect-aware `reasoning_effort`, or
+  `top_level_reasoning_effort`; the top-level form is the explicit contract for
+  local providers that reject the chat-template form.
 - `providers.models` carries per-model access bindings directly
 - each `providers.models[].backend_refs[]` item carries its own transport and auth fields such as `endpoint`, `base_url`, `protocol`, `auth_header`, `auth_prefix`, `api_key`, and `api_key_env`
 - `providers.models[].pricing` can price prompt, cached-input, cache-write, and completion tokens independently; an omitted cache-write rate inherits the prompt rate
@@ -130,7 +142,7 @@ Router-global defaults are now owned by the router itself, not by a second user-
 - `global.router.learning` owns cross-request Router Learning state.
 - `global.router.learning.adaptation` is online model-choice learning. `global.router.learning.protection` is session/conversation stability protection. Decisions remain semantic and can opt out with `routing.decisions[].adaptations.mode: bypass`; `algorithm.type: session_aware|elo|rl_driven|gmtrouter` is not part of the public contract.
 - `global.services` groups shared APIs and runtime services
-- `global.services.router_replay.enabled` provides the router-wide replay default, while route-local `router_replay.enabled: false` is the explicit opt-out
+- router replay is disabled by default; `global.services.router_replay.enabled` provides the router-wide switch, while route-local plugins can explicitly opt in or opt out
 - `global.stores` groups storage-backed services
 - `global.integrations` groups helper runtime integrations, including looper-owned ReMoM direct model slug registration for `vllm-sr/remom`, Fusion direct model slug registration for `vllm-sr/fusion`, and Router Flow direct model slug registration for `vllm-sr/flow`. Compatibility aliases such as `openrouter/fusion` are opt-in through `global.integrations.looper.*.model_names`; breadth, judge, panel, workflow planning, worker policy, and output contracts remain on `routing.decisions[]`.
 - `routing.decisions[].algorithm.remom.max_completion_tokens` optionally bounds every internal ReMoM completion while leaving request-facing model aliases separate from backend capability metadata.
@@ -140,6 +152,7 @@ Router-global defaults are now owned by the router itself, not by a second user-
 - `providers.models[].reliability` owns generated data-plane load balancing, bounded transport retry, circuit-breaker, and passive outlier-ejection settings for that model's backend cluster.
 - `response_cache` keeps response reuse route-local and supports exact, semantic, or exact-then-semantic lookup. Compatibility and tenant partitioning remain runtime-owned.
 - `context_compression` is a post-decision plugin that applies selected-model request budgets and target policies to a separate provider-bound working body without changing cache or signal input. JSON and multimodal structure are preserved, and RAG evidence requires explicit `targets.rag.mode: extractive`.
+- `tools.configuration.strip_tool_history` is a `mode: none` post-decision privacy control: it removes prior tool/function calls and results from the provider-bound body without changing the original conversation facts used by routing signals.
 - `global.model_catalog.modules.hallucination_mitigation.detector.backend` is a validated enum selecting the hallucination span detector: `candle` (default) runs the in-process token classifier, while `endpoint` delegates to a generative span detector behind an OpenAI-compatible server and requires an absolute `http(s)` `detector.endpoint` plus a `detector.model_id`. An unknown backend fails config validation instead of silently falling back to `candle`.
 - omitted fields keep the built-in default
 

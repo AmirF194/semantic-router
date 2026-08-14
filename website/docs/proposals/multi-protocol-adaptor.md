@@ -282,8 +282,8 @@ func (m *Manager) Wait()
 - `GET /v1/models` - List available models
 - `POST /v1/classify` - Classification endpoint
 - `POST /v1/route` - Routing decision endpoint
-- `GET /v1/router_replay` - List replay records
-- `GET /v1/router_replay/{id}` - Get replay record
+- `GET /v1/router_replay` - List replay records on the management plane
+- `GET /v1/router_replay/{id}` - Get a replay record on the management plane
 - `GET /health` - Health check
 - `GET /ready` - Readiness check
 
